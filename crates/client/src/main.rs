@@ -5,7 +5,7 @@ use std::{
     io::{self, Read, Write},
     net::TcpStream,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use gpui::{
@@ -42,6 +42,7 @@ const MESSAGE_TYPE_PING: u8 = 0;
 const MESSAGE_TYPE_VIDEO: u8 = 1;
 const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const FRAME_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const FRAME_STALE_TIMEOUT: Duration = Duration::from_millis(500);
 const STREAM_WIDTH: usize = 800;
 const STREAM_HEIGHT: usize = 600;
 const STREAM_FPS: u64 = 30;
@@ -208,15 +209,34 @@ impl PommeApp {
         .detach();
 
         self.receive_task = Some(cx.spawn(async move |app, cx| {
+            let mut last_frame_at: Option<Instant> = None;
+
             loop {
                 Timer::after(FRAME_POLL_INTERVAL).await;
                 let event = latest_event.lock().ok().and_then(|mut event| event.take());
                 let Some(event) = event else {
+                    if let Some(frame_at) = last_frame_at
+                        && frame_at.elapsed() >= FRAME_STALE_TIMEOUT
+                    {
+                        last_frame_at = None;
+                        if app
+                            .update(cx, |app, cx| {
+                                if app.frame.is_some() {
+                                    app.frame = None;
+                                    cx.notify();
+                                }
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                     continue;
                 };
 
                 match event {
                     ReceiveEvent::Frame(frame) => {
+                        last_frame_at = Some(Instant::now());
                         if app
                             .update(cx, |app, cx| {
                                 app.frame = Some(VideoFrame::CpuRgba(frame));
