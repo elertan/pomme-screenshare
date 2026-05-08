@@ -4210,6 +4210,7 @@ dependencies = [
  "objc2-core-graphics",
  "openh264",
  "unicode-segmentation",
+ "windows 0.62.2",
  "xcap",
 ]
 
