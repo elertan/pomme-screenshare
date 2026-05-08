@@ -8,6 +8,7 @@ license = "MIT"
 [dependencies]
 gpui = "0.2.2"
 image = { version = "0.25.10", default-features = false }
+openh264 = "0.9.3"
 unicode-segmentation = "1.12.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]

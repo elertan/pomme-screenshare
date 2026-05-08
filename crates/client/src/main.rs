@@ -2,8 +2,9 @@ mod text_input;
 mod video;
 
 use std::{
-    io::{self, Write},
+    io::{self, Read, Write},
     net::TcpStream,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -12,10 +13,11 @@ use gpui::{
     IntoElement, KeyBinding, ParentElement, Render, StatefulInteractiveElement, Styled, Task,
     Timer, Window, WindowBounds, WindowOptions, div, px, rgb, size,
 };
+use openh264::{decoder::Decoder, formats::YUVSource};
 use text_input::{
     Backspace, Copy, Cut, Delete, Left, Paste, Right, SelectAll, SelectLeft, SelectRight, TextInput,
 };
-use video::{VideoCanvas, VideoFrame};
+use video::{CpuRgbaFrame, VideoCanvas, VideoFrame};
 
 struct PommeApp {
     view: AppView,
@@ -24,11 +26,14 @@ struct PommeApp {
     connection: Option<TcpStream>,
     connect_task: Option<Task<()>>,
     keepalive_task: Option<Task<()>>,
+    receive_task: Option<Task<()>>,
     frame: Option<VideoFrame>,
-    stream_task: Option<Task<()>>,
 }
 
 const MESSAGE_TYPE_PING: u8 = 0;
+const MESSAGE_TYPE_VIDEO: u8 = 1;
+const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+const FRAME_POLL_INTERVAL: Duration = Duration::from_millis(16);
 
 enum AppView {
     Connect,
@@ -61,8 +66,8 @@ impl PommeApp {
             connection: None,
             connect_task: None,
             keepalive_task: None,
+            receive_task: None,
             frame: None,
-            stream_task: None,
         }
     }
 
@@ -108,35 +113,6 @@ impl PommeApp {
             .into_any_element()
     }
 
-    fn start_fake_stream(&mut self, cx: &mut Context<Self>) {
-        self.frame = Some(VideoFrame::solid_rgba(640, 360, [0, 0, 0, 255]));
-        self.stream_task = Some(cx.spawn(async move |app, cx| {
-            let mut show_white = false;
-
-            loop {
-                Timer::after(Duration::from_secs(1)).await;
-                show_white = !show_white;
-
-                let color = if show_white {
-                    [255, 255, 255, 255]
-                } else {
-                    [0, 0, 0, 255]
-                };
-
-                if app
-                    .update(cx, |app, cx| {
-                        app.frame = Some(VideoFrame::solid_rgba(640, 360, color));
-                        cx.notify();
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        }));
-        cx.notify();
-    }
-
     fn start_connect(&mut self, cx: &mut Context<Self>) {
         if matches!(self.connection_status, ConnectionStatus::Connecting) {
             return;
@@ -172,15 +148,16 @@ impl PommeApp {
                 match result {
                     Ok(connection) => {
                         let _ = connection.set_nodelay(true);
-                        match connection.try_clone() {
-                            Ok(keepalive_connection) => {
+                        match (connection.try_clone(), connection.try_clone()) {
+                            (Ok(keepalive_connection), Ok(receive_connection)) => {
                                 app.connection = Some(connection);
                                 app.connection_status = ConnectionStatus::Idle;
                                 app.view = AppView::Connected;
                                 app.start_keepalive(keepalive_connection, cx);
-                                app.start_fake_stream(cx);
+                                app.start_receiver(receive_connection, cx);
+                                cx.notify();
                             }
-                            Err(error) => {
+                            (Err(error), _) | (_, Err(error)) => {
                                 app.connection_status = ConnectionStatus::Failed(format!(
                                     "Failed to hold connection: {error}"
                                 ));
@@ -195,6 +172,46 @@ impl PommeApp {
                     }
                 }
             });
+        }));
+    }
+
+    fn start_receiver(&mut self, mut connection: TcpStream, cx: &mut Context<Self>) {
+        let latest_event = Arc::new(Mutex::new(None));
+        let worker_latest_event = Arc::clone(&latest_event);
+
+        cx.background_spawn(async move {
+            receive_frames(&mut connection, worker_latest_event);
+        })
+        .detach();
+
+        self.receive_task = Some(cx.spawn(async move |app, cx| {
+            loop {
+                Timer::after(FRAME_POLL_INTERVAL).await;
+                let event = latest_event.lock().ok().and_then(|mut event| event.take());
+                let Some(event) = event else {
+                    continue;
+                };
+
+                match event {
+                    ReceiveEvent::Frame(frame) => {
+                        if app
+                            .update(cx, |app, cx| {
+                                app.frame = Some(VideoFrame::CpuRgba(frame));
+                                cx.notify();
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    ReceiveEvent::Error(message) => {
+                        let _ = app.update(cx, |app, cx| {
+                            app.connection_lost(format!("Connection lost: {message}"), cx);
+                        });
+                        break;
+                    }
+                }
+            }
         }));
     }
 
@@ -221,7 +238,7 @@ impl PommeApp {
     fn connection_lost(&mut self, message: String, cx: &mut Context<Self>) {
         self.connection = None;
         self.keepalive_task = None;
-        self.stream_task = None;
+        self.receive_task = None;
         self.frame = None;
         self.view = AppView::Connect;
         self.connection_status = ConnectionStatus::Failed(message);
@@ -263,12 +280,78 @@ impl PommeApp {
     }
 }
 
+enum ReceiveEvent {
+    Frame(CpuRgbaFrame),
+    Error(String),
+}
+
 fn write_message(writer: &mut impl Write, message_type: u8, payload: &[u8]) -> io::Result<()> {
     let len = payload.len() + 1;
     writer.write_all(&(len as u32).to_be_bytes())?;
     writer.write_all(&[message_type])?;
     writer.write_all(payload)?;
     writer.flush()
+}
+
+fn read_message(reader: &mut impl Read) -> io::Result<Vec<u8>> {
+    let mut len_bytes = [0; 4];
+    reader.read_exact(&mut len_bytes)?;
+    let len = u32::from_be_bytes(len_bytes) as usize;
+
+    if len > MAX_MESSAGE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("message too large: {len} bytes"),
+        ));
+    }
+
+    let mut payload = vec![0; len];
+    reader.read_exact(&mut payload)?;
+    Ok(payload)
+}
+
+fn receive_frames(connection: &mut TcpStream, latest_event: Arc<Mutex<Option<ReceiveEvent>>>) {
+    let result = decode_frames(connection, &latest_event);
+
+    if let Err(error) = result
+        && let Ok(mut event) = latest_event.lock()
+    {
+        *event = Some(ReceiveEvent::Error(error));
+    }
+}
+
+fn decode_frames(
+    connection: &mut TcpStream,
+    latest_event: &Arc<Mutex<Option<ReceiveEvent>>>,
+) -> Result<(), String> {
+    let mut decoder = Decoder::new().map_err(|error| error.to_string())?;
+
+    loop {
+        let message = read_message(connection).map_err(|error| error.to_string())?;
+        let Some((&message_type, payload)) = message.split_first() else {
+            continue;
+        };
+
+        if message_type != MESSAGE_TYPE_VIDEO {
+            continue;
+        }
+
+        if let Some(decoded) = decoder.decode(payload).map_err(|error| error.to_string())? {
+            let (width, height) = decoded.dimensions();
+            let mut rgba = vec![0; decoded.rgba8_len()];
+            decoded.write_rgba8(&mut rgba);
+
+            let frame = CpuRgbaFrame {
+                width: width as u32,
+                height: height as u32,
+                pixels: rgba.into(),
+            };
+
+            if let Ok(mut event) = latest_event.lock() {
+                *event = Some(ReceiveEvent::Frame(frame));
+            }
+        }
+    }
 }
 
 fn main() {

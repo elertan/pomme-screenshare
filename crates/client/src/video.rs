@@ -26,10 +26,6 @@ pub struct CpuRgbaFrame {
 }
 
 impl VideoFrame {
-    pub fn solid_rgba(width: u32, height: u32, rgba: [u8; 4]) -> Self {
-        Self::CpuRgba(CpuRgbaFrame::solid(width, height, rgba))
-    }
-
     fn render(self) -> AnyElement {
         match self {
             VideoFrame::CpuRgba(frame) => frame.render(),
@@ -45,21 +41,6 @@ impl VideoFrame {
 }
 
 impl CpuRgbaFrame {
-    pub fn solid(width: u32, height: u32, rgba: [u8; 4]) -> Self {
-        let pixel_count = width as usize * height as usize;
-        let mut pixels = Vec::with_capacity(pixel_count * 4);
-
-        for _ in 0..pixel_count {
-            pixels.extend_from_slice(&rgba);
-        }
-
-        Self {
-            width,
-            height,
-            pixels: pixels.into(),
-        }
-    }
-
     fn render(self) -> AnyElement {
         match self.render_image() {
             Some(image) => img(image)
