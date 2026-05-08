@@ -45,7 +45,7 @@ struct PommeApp {
 
 const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const FRAME_POLL_INTERVAL: Duration = Duration::from_millis(16);
-const FRAME_STALE_TIMEOUT: Duration = Duration::from_secs(2);
+const FRAME_STALE_TIMEOUT: Duration = Duration::from_secs(10);
 const STREAM_FPS: u64 = 30;
 const STREAM_FRAME_INTERVAL: Duration = Duration::from_millis(1000 / STREAM_FPS);
 const STREAM_BITRATE_BPS: u32 = 2_000_000;
