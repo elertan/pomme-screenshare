@@ -10,9 +10,10 @@ use std::{
 
 use gpui::{
     AnyElement, App, AppContext, Application, Bounds, Context, Entity, InteractiveElement,
-    IntoElement, KeyBinding, ParentElement, Render, StatefulInteractiveElement, Styled, Task,
-    Timer, Window, WindowBounds, WindowOptions, div, px, rgb, rgba, size,
+    IntoElement, KeyBinding, ParentElement, Render, StatefulInteractiveElement, Styled,
+    StyledImage, Task, Timer, Window, WindowBounds, WindowOptions, div, img, px, rgb, rgba, size,
 };
+use image::{Frame as ImageFrame, RgbaImage};
 use openh264::{
     OpenH264API,
     decoder::Decoder,
@@ -35,6 +36,8 @@ struct PommeApp {
     keepalive_task: Option<Task<()>>,
     receive_task: Option<Task<()>>,
     send_task: Option<Task<()>>,
+    share_sources_task: Option<Task<()>>,
+    share_sources: ShareSources,
     frame: Option<VideoFrame>,
     share_modal_open: bool,
 }
@@ -57,6 +60,29 @@ enum ConnectionStatus {
     Idle,
     Connecting,
     Failed(String),
+}
+
+enum ShareSources {
+    Idle,
+    Loading,
+    Loaded(Vec<ShareSource>),
+    Failed(String),
+}
+
+#[derive(Clone)]
+struct ShareSource {
+    id: u32,
+    title: String,
+    app_name: String,
+    preview: Option<ShareSourcePreview>,
+    preview_error: Option<String>,
+}
+
+#[derive(Clone)]
+struct ShareSourcePreview {
+    width: u32,
+    height: u32,
+    pixels: Arc<[u8]>,
 }
 
 #[repr(u8)]
@@ -102,6 +128,8 @@ impl PommeApp {
             keepalive_task: None,
             receive_task: None,
             send_task: None,
+            share_sources_task: None,
+            share_sources: ShareSources::Idle,
             frame: None,
             share_modal_open: false,
         }
@@ -200,8 +228,7 @@ impl PommeApp {
                             .child("Share...")
                             .hover(|style| style.bg(rgb(0xebe7e1)))
                             .on_click(cx.listener(|app, _, _, cx| {
-                                app.share_modal_open = true;
-                                cx.notify();
+                                app.open_share_modal(cx);
                             })),
                     ),
             )
@@ -402,6 +429,7 @@ impl PommeApp {
         self.keepalive_task = None;
         self.receive_task = None;
         self.send_task = None;
+        self.share_sources_task = None;
         self.frame = None;
         self.share_modal_open = false;
         self.view = AppView::Connect;
@@ -420,6 +448,7 @@ impl PommeApp {
         self.keepalive_task = None;
         self.receive_task = None;
         self.send_task = None;
+        self.share_sources_task = None;
         self.frame = None;
         self.share_modal_open = false;
         self.view = AppView::Connect;
@@ -427,6 +456,30 @@ impl PommeApp {
         self.server_input
             .update(cx, |input, _| input.set_disabled(false));
         cx.notify();
+    }
+
+    fn open_share_modal(&mut self, cx: &mut Context<Self>) {
+        self.share_modal_open = true;
+        self.load_share_sources(cx);
+        cx.notify();
+    }
+
+    fn load_share_sources(&mut self, cx: &mut Context<Self>) {
+        self.share_sources = ShareSources::Loading;
+
+        let load_sources = cx.background_spawn(async { load_share_sources() });
+        self.share_sources_task = Some(cx.spawn(async move |app, cx| {
+            let result = load_sources.await;
+
+            let _ = app.update(cx, |app, cx| {
+                app.share_sources = match result {
+                    Ok(sources) => ShareSources::Loaded(sources),
+                    Err(message) => ShareSources::Failed(message),
+                };
+                app.share_sources_task = None;
+                cx.notify();
+            });
+        }));
     }
 
     fn render_share_modal(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -482,7 +535,7 @@ impl PommeApp {
                                         })),
                                 ),
                         )
-                        .child(render_share_source_grid())
+                        .child(render_share_source_grid(&self.share_sources))
                         .child(
                             div()
                                 .id("share-entire-screen-button")
@@ -537,36 +590,209 @@ impl PommeApp {
     }
 }
 
-fn render_share_source_grid() -> AnyElement {
+fn render_share_source_grid(sources: &ShareSources) -> AnyElement {
+    match sources {
+        ShareSources::Idle | ShareSources::Loading => div()
+            .id("share-source-status")
+            .flex_1()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_color(rgb(0x4b5563))
+            .child("Loading windows...")
+            .into_any_element(),
+        ShareSources::Failed(message) => div()
+            .id("share-source-error")
+            .flex_1()
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_4()
+            .text_center()
+            .text_color(rgb(0xb91c1c))
+            .child(message.clone())
+            .into_any_element(),
+        ShareSources::Loaded(sources) if sources.is_empty() => div()
+            .id("share-source-empty")
+            .flex_1()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_color(rgb(0x4b5563))
+            .child("No shareable windows found.")
+            .into_any_element(),
+        ShareSources::Loaded(sources) => div()
+            .id("share-source-grid")
+            .grid()
+            .grid_cols(2)
+            .gap_3()
+            .flex_1()
+            .overflow_y_scroll()
+            .children(sources.iter().map(render_share_source))
+            .into_any_element(),
+    }
+}
+
+fn render_share_source(source: &ShareSource) -> AnyElement {
     div()
-        .id("share-source-grid")
-        .grid()
-        .grid_cols(2)
-        .gap_3()
-        .flex_1()
-        .overflow_y_scroll()
-        .children((1_usize..=8).map(|index| {
+        .id(("share-source", source.id))
+        .flex()
+        .flex_col()
+        .gap_2()
+        .rounded_lg()
+        .border_1()
+        .border_color(rgb(0xd1d5db))
+        .bg(rgb(0xffffff))
+        .p_3()
+        .hover(|style| style.bg(rgb(0xf9fafb)).border_color(rgb(0x1f2933)))
+        .on_click(|_, _, _| {})
+        .child(render_share_source_preview(source))
+        .child(
             div()
-                .id(("share-source-placeholder", index))
-                .flex()
-                .flex_col()
-                .gap_2()
-                .rounded_lg()
-                .border_1()
-                .border_color(rgb(0xd1d5db))
-                .bg(rgb(0xffffff))
-                .p_3()
-                .hover(|style| style.bg(rgb(0xf9fafb)).border_color(rgb(0x1f2933)))
-                .on_click(|_, _, _| {})
-                .child(div().h(px(92.0)).w_full().rounded_md().bg(rgb(0xe5e7eb)))
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(0x4b5563))
-                        .child(format!("Window {index}")),
-                )
-        }))
+                .text_sm()
+                .text_color(rgb(0x1f2933))
+                .truncate()
+                .child(source.title.clone()),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(0x6b7280))
+                .truncate()
+                .child(source.app_name.clone()),
+        )
         .into_any_element()
+}
+
+fn render_share_source_preview(source: &ShareSource) -> AnyElement {
+    match &source.preview {
+        Some(preview) => {
+            let Some(image) = preview.render_image() else {
+                return preview_placeholder("Preview unavailable");
+            };
+
+            img(image)
+                .h(px(92.0))
+                .w_full()
+                .rounded_md()
+                .bg(rgb(0xe5e7eb))
+                .object_fit(gpui::ObjectFit::Contain)
+                .into_any_element()
+        }
+        None => preview_placeholder(
+            source
+                .preview_error
+                .as_deref()
+                .unwrap_or("Preview unavailable"),
+        ),
+    }
+}
+
+fn preview_placeholder(message: &str) -> AnyElement {
+    div()
+        .h(px(92.0))
+        .w_full()
+        .rounded_md()
+        .bg(rgb(0xe5e7eb))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_xs()
+        .text_center()
+        .text_color(rgb(0x6b7280))
+        .child(message.to_string())
+        .into_any_element()
+}
+
+impl ShareSourcePreview {
+    fn from_image(image: RgbaImage) -> Self {
+        Self {
+            width: image.width(),
+            height: image.height(),
+            pixels: image.into_raw().into(),
+        }
+    }
+
+    fn render_image(&self) -> Option<Arc<gpui::RenderImage>> {
+        let image = RgbaImage::from_raw(self.width, self.height, self.pixels.to_vec())?;
+        Some(Arc::new(gpui::RenderImage::new([ImageFrame::new(image)])))
+    }
+}
+
+fn load_share_sources() -> Result<Vec<ShareSource>, String> {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        load_platform_share_sources()
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Err("Window previews are only implemented for macOS and Windows.".to_string())
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn load_platform_share_sources() -> Result<Vec<ShareSource>, String> {
+    use xcap::Window as CaptureWindow;
+
+    let windows = CaptureWindow::all().map_err(format_capture_error)?;
+    let mut sources = Vec::new();
+
+    for window in windows {
+        if window.is_minimized().unwrap_or(true) {
+            continue;
+        }
+
+        let width = window.width().unwrap_or_default();
+        let height = window.height().unwrap_or_default();
+        if width == 0 || height == 0 {
+            continue;
+        }
+
+        let title = window
+            .title()
+            .ok()
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or_else(|| "Untitled window".to_string());
+        let app_name = window
+            .app_name()
+            .ok()
+            .filter(|app_name| !app_name.trim().is_empty())
+            .unwrap_or_else(|| "Unknown app".to_string());
+        let id = window.id().unwrap_or(sources.len() as u32);
+
+        let (preview, preview_error) = match window.capture_image() {
+            Ok(image) => {
+                let thumbnail = image::imageops::thumbnail(&image, 360, 180);
+                (Some(ShareSourcePreview::from_image(thumbnail)), None)
+            }
+            Err(error) => (None, Some(format_capture_error(error))),
+        };
+
+        sources.push(ShareSource {
+            id,
+            title,
+            app_name,
+            preview,
+            preview_error,
+        });
+    }
+
+    Ok(sources)
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn format_capture_error(error: xcap::XCapError) -> String {
+    let message = error.to_string();
+
+    #[cfg(target_os = "macos")]
+    {
+        if message.to_lowercase().contains("permission") {
+            return "Screen Recording permission is required. Enable it in System Settings, then reopen Pomme Screenshare.".to_string();
+        }
+    }
+
+    message
 }
 
 enum ReceiveEvent {
