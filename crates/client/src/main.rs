@@ -16,7 +16,9 @@ use gpui::{
 use openh264::{
     OpenH264API,
     decoder::Decoder,
-    encoder::{BitRate, Encoder, EncoderConfig, FrameRate, RateControlMode, UsageType},
+    encoder::{
+        BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode, UsageType,
+    },
     formats::{RgbSliceU8, YUVBuffer, YUVSource},
 };
 use text_input::{
@@ -263,7 +265,9 @@ impl PommeApp {
                 .usage_type(UsageType::ScreenContentRealTime)
                 .bitrate(BitRate::from_bps(STREAM_BITRATE_BPS))
                 .max_frame_rate(FrameRate::from_hz(STREAM_FPS as f32))
-                .rate_control_mode(RateControlMode::Bitrate);
+                .rate_control_mode(RateControlMode::Bitrate)
+                .intra_frame_period(IntraFramePeriod::from_num_frames(STREAM_FPS as u32))
+                .skip_frames(false);
             let api = OpenH264API::from_source();
             let mut encoder =
                 Encoder::with_api_config(api, config).map_err(|error| error.to_string())?;
@@ -272,8 +276,10 @@ impl PommeApp {
                 {
                     let bitstream = encoder.encode(&frame).map_err(|error| error.to_string())?;
                     let payload = bitstream.to_vec();
-                    write_message(&mut connection, MESSAGE_TYPE_VIDEO, &payload)
-                        .map_err(|error| error.to_string())?;
+                    if !payload.is_empty() {
+                        write_message(&mut connection, MESSAGE_TYPE_VIDEO, &payload)
+                            .map_err(|error| error.to_string())?;
+                    }
                 }
                 Timer::after(STREAM_FRAME_INTERVAL).await;
             }
@@ -401,7 +407,15 @@ fn decode_frames(
             continue;
         }
 
-        if let Some(decoded) = decoder.decode(payload).map_err(|error| error.to_string())? {
+        if payload.is_empty() {
+            continue;
+        }
+
+        let Some(decoded) = decoder.decode(payload).unwrap_or(None) else {
+            continue;
+        };
+
+        {
             let (width, height) = decoded.dimensions();
             let mut rgba = vec![0; decoded.rgba8_len()];
             decoded.write_rgba8(&mut rgba);
