@@ -45,7 +45,7 @@ struct PommeApp {
 
 const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const FRAME_POLL_INTERVAL: Duration = Duration::from_millis(16);
-const FRAME_STALE_TIMEOUT: Duration = Duration::from_millis(500);
+const FRAME_STALE_TIMEOUT: Duration = Duration::from_secs(2);
 const STREAM_FPS: u64 = 30;
 const STREAM_FRAME_INTERVAL: Duration = Duration::from_millis(1000 / STREAM_FPS);
 const STREAM_BITRATE_BPS: u32 = 2_000_000;
@@ -398,6 +398,7 @@ impl PommeApp {
         cx: &mut Context<Self>,
     ) {
         let sender = cx.background_spawn(async move {
+            let mut source = ShareCaptureSource::new(source_id)?;
             let config = EncoderConfig::new()
                 .usage_type(UsageType::ScreenContentRealTime)
                 .bitrate(BitRate::from_bps(STREAM_BITRATE_BPS))
@@ -411,7 +412,7 @@ impl PommeApp {
 
             loop {
                 {
-                    let Some(frame) = capture_share_source_frame(source_id) else {
+                    let Some(frame) = source.capture_frame() else {
                         return Ok(());
                     };
 
@@ -746,19 +747,46 @@ impl ShareSourcePreview {
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-fn capture_share_source_frame(source_id: u32) -> Option<YUVBuffer> {
-    use xcap::Window as CaptureWindow;
+struct ShareCaptureSource {
+    window: xcap::Window,
+}
 
-    let window = CaptureWindow::all()
-        .ok()?
-        .into_iter()
-        .find(|window| window.id().ok() == Some(source_id))?;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+impl ShareCaptureSource {
+    fn new(source_id: u32) -> Result<Self, String> {
+        let window = xcap::Window::all()
+            .map_err(format_capture_error)?
+            .into_iter()
+            .find(|window| window.id().ok() == Some(source_id))
+            .ok_or_else(|| "Share source no longer exists.".to_string())?;
 
-    if window.is_minimized().unwrap_or(true) {
-        return None;
+        Ok(Self { window })
     }
 
-    let image = window.capture_image().ok()?;
+    fn capture_frame(&mut self) -> Option<YUVBuffer> {
+        if self.window.is_minimized().unwrap_or(true) {
+            return None;
+        }
+
+        image_to_yuv(self.window.capture_image().ok()?)
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+struct ShareCaptureSource;
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+impl ShareCaptureSource {
+    fn new(_source_id: u32) -> Result<Self, String> {
+        Err("Window sharing is only implemented for macOS and Windows.".to_string())
+    }
+
+    fn capture_frame(&mut self) -> Option<YUVBuffer> {
+        None
+    }
+}
+
+fn image_to_yuv(image: RgbaImage) -> Option<YUVBuffer> {
     let width = image.width() & !1;
     let height = image.height() & !1;
     if width == 0 || height == 0 {
@@ -776,11 +804,6 @@ fn capture_share_source_frame(source_id: u32) -> Option<YUVBuffer> {
         image.as_raw(),
         dimensions,
     )))
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn capture_share_source_frame(_source_id: u32) -> Option<YUVBuffer> {
-    None
 }
 
 fn load_share_sources() -> Result<Vec<ShareSource>, String> {
