@@ -4,6 +4,7 @@ mod video;
 use std::{
     io::{self, Read, Write},
     net::{Shutdown, TcpStream},
+    process,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -20,7 +21,7 @@ use openh264::{
     encoder::{
         BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode, UsageType,
     },
-    formats::{RgbSliceU8, YUVBuffer, YUVSource},
+    formats::{RgbaSliceU8, YUVBuffer, YUVSource},
 };
 use text_input::{
     Backspace, Copy, Cut, Delete, Left, Paste, Right, SelectAll, SelectLeft, SelectRight, TextInput,
@@ -45,8 +46,6 @@ struct PommeApp {
 const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const FRAME_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const FRAME_STALE_TIMEOUT: Duration = Duration::from_millis(500);
-const STREAM_WIDTH: usize = 800;
-const STREAM_HEIGHT: usize = 600;
 const STREAM_FPS: u64 = 30;
 const STREAM_FRAME_INTERVAL: Duration = Duration::from_millis(1000 / STREAM_FPS);
 const STREAM_BITRATE_BPS: u32 = 2_000_000;
@@ -271,25 +270,16 @@ impl PommeApp {
                 match result {
                     Ok(connection) => {
                         let _ = connection.set_nodelay(true);
-                        match (
-                            connection.try_clone(),
-                            connection.try_clone(),
-                            connection.try_clone(),
-                        ) {
-                            (
-                                Ok(keepalive_connection),
-                                Ok(receive_connection),
-                                Ok(send_connection),
-                            ) => {
+                        match (connection.try_clone(), connection.try_clone()) {
+                            (Ok(keepalive_connection), Ok(receive_connection)) => {
                                 app.connection = Some(connection);
                                 app.connection_status = ConnectionStatus::Idle;
                                 app.view = AppView::Connected;
                                 app.start_keepalive(keepalive_connection, cx);
                                 app.start_receiver(receive_connection, cx);
-                                app.start_red_stream(send_connection, cx);
                                 cx.notify();
                             }
-                            (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+                            (Err(error), _) | (_, Err(error)) => {
                                 app.connection_status = ConnectionStatus::Failed(format!(
                                     "Failed to hold connection: {error}"
                                 ));
@@ -386,9 +376,28 @@ impl PommeApp {
         }));
     }
 
-    fn start_red_stream(&mut self, mut connection: TcpStream, cx: &mut Context<Self>) {
+    fn start_share_source(&mut self, source_id: u32, cx: &mut Context<Self>) {
+        let Some(connection) = &self.connection else {
+            return;
+        };
+
+        let Ok(connection) = connection.try_clone() else {
+            return;
+        };
+
+        self.send_task = None;
+        self.share_modal_open = false;
+        self.start_share_stream(source_id, connection, cx);
+        cx.notify();
+    }
+
+    fn start_share_stream(
+        &mut self,
+        source_id: u32,
+        mut connection: TcpStream,
+        cx: &mut Context<Self>,
+    ) {
         let sender = cx.background_spawn(async move {
-            let frame = red_test_frame();
             let config = EncoderConfig::new()
                 .usage_type(UsageType::ScreenContentRealTime)
                 .bitrate(BitRate::from_bps(STREAM_BITRATE_BPS))
@@ -402,6 +411,10 @@ impl PommeApp {
 
             loop {
                 {
+                    let Some(frame) = capture_share_source_frame(source_id) else {
+                        return Ok(());
+                    };
+
                     let bitstream = encoder.encode(&frame).map_err(|error| error.to_string())?;
                     let payload = bitstream.to_vec();
                     if !payload.is_empty() {
@@ -535,7 +548,7 @@ impl PommeApp {
                                         })),
                                 ),
                         )
-                        .child(render_share_source_grid(&self.share_sources))
+                        .child(render_share_source_grid(&self.share_sources, cx))
                         .child(
                             div()
                                 .id("share-entire-screen-button")
@@ -590,7 +603,7 @@ impl PommeApp {
     }
 }
 
-fn render_share_source_grid(sources: &ShareSources) -> AnyElement {
+fn render_share_source_grid(sources: &ShareSources, cx: &mut Context<PommeApp>) -> AnyElement {
     match sources {
         ShareSources::Idle | ShareSources::Loading => div()
             .id("share-source-status")
@@ -609,8 +622,16 @@ fn render_share_source_grid(sources: &ShareSources) -> AnyElement {
             .justify_center()
             .p_4()
             .text_center()
+            .text_sm()
             .text_color(rgb(0xb91c1c))
-            .child(message.clone())
+            .child(
+                div()
+                    .w_full()
+                    .overflow_hidden()
+                    .whitespace_normal()
+                    .line_clamp(5)
+                    .child(message.clone()),
+            )
             .into_any_element(),
         ShareSources::Loaded(sources) if sources.is_empty() => div()
             .id("share-source-empty")
@@ -628,16 +649,19 @@ fn render_share_source_grid(sources: &ShareSources) -> AnyElement {
             .gap_3()
             .flex_1()
             .overflow_y_scroll()
-            .children(sources.iter().map(render_share_source))
+            .children(sources.iter().map(|source| render_share_source(source, cx)))
             .into_any_element(),
     }
 }
 
-fn render_share_source(source: &ShareSource) -> AnyElement {
+fn render_share_source(source: &ShareSource, cx: &mut Context<PommeApp>) -> AnyElement {
+    let source_id = source.id;
+
     div()
         .id(("share-source", source.id))
         .flex()
         .flex_col()
+        .h(px(180.0))
         .gap_2()
         .rounded_lg()
         .border_1()
@@ -645,7 +669,9 @@ fn render_share_source(source: &ShareSource) -> AnyElement {
         .bg(rgb(0xffffff))
         .p_3()
         .hover(|style| style.bg(rgb(0xf9fafb)).border_color(rgb(0x1f2933)))
-        .on_click(|_, _, _| {})
+        .on_click(cx.listener(move |app, _, _, cx| {
+            app.start_share_source(source_id, cx);
+        }))
         .child(render_share_source_preview(source))
         .child(
             div()
@@ -719,6 +745,44 @@ impl ShareSourcePreview {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn capture_share_source_frame(source_id: u32) -> Option<YUVBuffer> {
+    use xcap::Window as CaptureWindow;
+
+    let window = CaptureWindow::all()
+        .ok()?
+        .into_iter()
+        .find(|window| window.id().ok() == Some(source_id))?;
+
+    if window.is_minimized().unwrap_or(true) {
+        return None;
+    }
+
+    let image = window.capture_image().ok()?;
+    let width = image.width() & !1;
+    let height = image.height() & !1;
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    let image = if width != image.width() || height != image.height() {
+        image::imageops::crop_imm(&image, 0, 0, width, height).to_image()
+    } else {
+        image
+    };
+    let dimensions = (width as usize, height as usize);
+
+    Some(YUVBuffer::from_rgb_source(RgbaSliceU8::new(
+        image.as_raw(),
+        dimensions,
+    )))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn capture_share_source_frame(_source_id: u32) -> Option<YUVBuffer> {
+    None
+}
+
 fn load_share_sources() -> Result<Vec<ShareSource>, String> {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
@@ -735,8 +799,11 @@ fn load_share_sources() -> Result<Vec<ShareSource>, String> {
 fn load_platform_share_sources() -> Result<Vec<ShareSource>, String> {
     use xcap::Window as CaptureWindow;
 
+    request_share_source_access();
+
     let windows = CaptureWindow::all().map_err(format_capture_error)?;
     let mut sources = Vec::new();
+    let current_pid = process::id();
 
     for window in windows {
         if window.is_minimized().unwrap_or(true) {
@@ -746,6 +813,11 @@ fn load_platform_share_sources() -> Result<Vec<ShareSource>, String> {
         let width = window.width().unwrap_or_default();
         let height = window.height().unwrap_or_default();
         if width == 0 || height == 0 {
+            continue;
+        }
+
+        let pid = window.pid().unwrap_or_default();
+        if pid == current_pid {
             continue;
         }
 
@@ -760,6 +832,10 @@ fn load_platform_share_sources() -> Result<Vec<ShareSource>, String> {
             .filter(|app_name| !app_name.trim().is_empty())
             .unwrap_or_else(|| "Unknown app".to_string());
         let id = window.id().unwrap_or(sources.len() as u32);
+
+        if should_hide_share_source(&title, &app_name, width, height) {
+            continue;
+        }
 
         let (preview, preview_error) = match window.capture_image() {
             Ok(image) => {
@@ -778,7 +854,49 @@ fn load_platform_share_sources() -> Result<Vec<ShareSource>, String> {
         });
     }
 
+    if sources.is_empty() && !has_share_source_access() {
+        return Err(screen_recording_permission_message());
+    }
+
     Ok(sources)
+}
+
+fn should_hide_share_source(title: &str, app_name: &str, width: u32, height: u32) -> bool {
+    app_name == "Window Server"
+        || title == "Menubar"
+        || title == "StatusIndicator"
+        || width < 80
+        || height < 60
+}
+
+#[cfg(target_os = "macos")]
+fn request_share_source_access() {
+    if !objc2_core_graphics::CGPreflightScreenCaptureAccess() {
+        let _ = objc2_core_graphics::CGRequestScreenCaptureAccess();
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn request_share_source_access() {}
+
+#[cfg(target_os = "macos")]
+fn has_share_source_access() -> bool {
+    objc2_core_graphics::CGPreflightScreenCaptureAccess()
+}
+
+#[cfg(target_os = "windows")]
+fn has_share_source_access() -> bool {
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn screen_recording_permission_message() -> String {
+    "Screen Recording permission is required. Enable Pomme Screenshare in System Settings, then fully quit and reopen the app.".to_string()
+}
+
+#[cfg(target_os = "windows")]
+fn screen_recording_permission_message() -> String {
+    "Window capture permission was denied.".to_string()
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -798,15 +916,6 @@ fn format_capture_error(error: xcap::XCapError) -> String {
 enum ReceiveEvent {
     Frame(CpuRgbaFrame),
     Error(String),
-}
-
-fn red_test_frame() -> YUVBuffer {
-    let mut rgb = Vec::with_capacity(STREAM_WIDTH * STREAM_HEIGHT * 3);
-    for _ in 0..STREAM_WIDTH * STREAM_HEIGHT {
-        rgb.extend_from_slice(&[255, 0, 0]);
-    }
-
-    YUVBuffer::from_rgb8_source(RgbSliceU8::new(&rgb, (STREAM_WIDTH, STREAM_HEIGHT)))
 }
 
 fn write_message(
