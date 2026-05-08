@@ -3732,12 +3732,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5da3b0203fd7ee5720aa0b5e790b591aa5d3f41c3ed2c34a3a393382198af2f7"
 
 [[package]]
-name = "pomme-screenshare"
+name = "pomme-screenshare-client"
 version = "0.1.0"
 dependencies = [
  "core-video",
  "gpui",
  "image",
+ "unicode-segmentation",
+]
+
+[[package]]
+name = "pomme-screenshare-server"
+version = "0.1.0"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]

@@ -1,0 +1,14 @@
+[package]
+name = "pomme-screenshare-client"
+version = "0.1.0"
+edition = "2024"
+description = "GPUI desktop client for Pomme Screenshare."
+license = "MIT"
+
+[dependencies]
+gpui = "0.2.2"
+image = { version = "0.25.10", default-features = false }
+unicode-segmentation = "1.12.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-video = "0.4.3"

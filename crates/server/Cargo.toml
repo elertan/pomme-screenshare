@@ -1,0 +1,9 @@
+[package]
+name = "pomme-screenshare-server"
+version = "0.1.0"
+edition = "2024"
+description = "Relay server for Pomme Screenshare video packets."
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1.52.3", features = ["io-util", "net", "rt-multi-thread", "sync"] }
