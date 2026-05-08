@@ -139,7 +139,7 @@ mod media_foundation {
                     .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
                     .map_err(format_windows_error)?;
                 input_type
-                    .SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_I420)
+                    .SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)
                     .map_err(format_windows_error)?;
                 input_type
                     .SetUINT64(
@@ -209,15 +209,13 @@ mod media_foundation {
                     .Lock(&mut data, None, None)
                     .map_err(format_windows_error)?;
                 ptr::copy_nonoverlapping(frame.y().as_ptr(), data, frame.y().len());
-                ptr::copy_nonoverlapping(
-                    frame.u().as_ptr(),
-                    data.add(frame.y().len()),
-                    frame.u().len(),
-                );
-                ptr::copy_nonoverlapping(
-                    frame.v().as_ptr(),
-                    data.add(frame.y().len() + frame.u().len()),
-                    frame.v().len(),
+                write_nv12_chroma(
+                    frame.u(),
+                    frame.v(),
+                    std::slice::from_raw_parts_mut(
+                        data.add(frame.y().len()),
+                        frame.u().len() + frame.v().len(),
+                    ),
                 );
                 buffer.Unlock().map_err(format_windows_error)?;
                 buffer
@@ -296,6 +294,17 @@ mod media_foundation {
             buffer.Unlock().map_err(format_windows_error)?;
 
             Ok(())
+        }
+    }
+
+    fn write_nv12_chroma(u_plane: &[u8], v_plane: &[u8], output: &mut [u8]) {
+        for ((&u, &v), chunk) in u_plane
+            .iter()
+            .zip(v_plane.iter())
+            .zip(output.chunks_exact_mut(2))
+        {
+            chunk[0] = u;
+            chunk[1] = v;
         }
     }
 
