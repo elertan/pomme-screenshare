@@ -11,7 +11,7 @@ use std::{
 use gpui::{
     AnyElement, App, AppContext, Application, Bounds, Context, Entity, InteractiveElement,
     IntoElement, KeyBinding, ParentElement, Render, StatefulInteractiveElement, Styled, Task,
-    Timer, Window, WindowBounds, WindowKind, WindowOptions, div, px, rgb, size,
+    Timer, Window, WindowBounds, WindowOptions, div, px, rgb, rgba, size,
 };
 use openh264::{
     OpenH264API,
@@ -36,6 +36,7 @@ struct PommeApp {
     receive_task: Option<Task<()>>,
     send_task: Option<Task<()>>,
     frame: Option<VideoFrame>,
+    share_modal_open: bool,
 }
 
 const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -102,6 +103,7 @@ impl PommeApp {
             receive_task: None,
             send_task: None,
             frame: None,
+            share_modal_open: false,
         }
     }
 
@@ -142,6 +144,7 @@ impl PommeApp {
     fn render_connected(&self, cx: &mut Context<Self>) -> AnyElement {
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(rgb(0x000000))
@@ -197,10 +200,12 @@ impl PommeApp {
                             .child("Share...")
                             .hover(|style| style.bg(rgb(0xebe7e1)))
                             .on_click(cx.listener(|app, _, _, cx| {
-                                app.open_share_window(cx);
+                                app.share_modal_open = true;
+                                cx.notify();
                             })),
                     ),
             )
+            .children(self.render_share_modal(cx))
             .into_any_element()
     }
 
@@ -398,6 +403,7 @@ impl PommeApp {
         self.receive_task = None;
         self.send_task = None;
         self.frame = None;
+        self.share_modal_open = false;
         self.view = AppView::Connect;
         self.connection_status = ConnectionStatus::Failed(message);
         self.server_input
@@ -415,6 +421,7 @@ impl PommeApp {
         self.receive_task = None;
         self.send_task = None;
         self.frame = None;
+        self.share_modal_open = false;
         self.view = AppView::Connect;
         self.connection_status = ConnectionStatus::Idle;
         self.server_input
@@ -422,26 +429,79 @@ impl PommeApp {
         cx.notify();
     }
 
-    fn open_share_window(&mut self, cx: &mut Context<Self>) {
-        let bounds = Bounds::centered(None, size(px(520.0), px(420.0)), cx);
-        let window = cx.open_window(
-            WindowOptions {
-                titlebar: Some(gpui::TitlebarOptions {
-                    title: Some("Share...".into()),
-                    ..Default::default()
-                }),
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                kind: WindowKind::Floating,
-                is_resizable: false,
-                is_minimizable: false,
-                ..Default::default()
-            },
-            |_, cx| cx.new(|_| ShareWindow),
-        );
-
-        if let Ok(window) = window {
-            let _ = window.update(cx, |_, window, _| window.activate_window());
-        }
+    fn render_share_modal(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.share_modal_open.then(|| {
+            div()
+                .id("share-modal-backdrop")
+                .absolute()
+                .top_0()
+                .right_0()
+                .bottom_0()
+                .left_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgba(0x00000073))
+                .block_mouse_except_scroll()
+                .child(
+                    div()
+                        .id("share-modal")
+                        .w(px(520.0))
+                        .h(px(420.0))
+                        .flex()
+                        .flex_col()
+                        .gap_4()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(0xd1d5db))
+                        .bg(rgb(0xf7f5f2))
+                        .p_4()
+                        .text_color(rgb(0x1f2933))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(div().text_xl().child("Share..."))
+                                .child(
+                                    div()
+                                        .id("share-modal-close")
+                                        .w(px(36.0))
+                                        .h(px(36.0))
+                                        .rounded_lg()
+                                        .border_1()
+                                        .border_color(rgb(0xd1d5db))
+                                        .bg(rgb(0xffffff))
+                                        .text_lg()
+                                        .text_center()
+                                        .child("x")
+                                        .hover(|style| style.bg(rgb(0xebe7e1)))
+                                        .on_click(cx.listener(|app, _, _, cx| {
+                                            app.share_modal_open = false;
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                        .child(render_share_source_grid())
+                        .child(
+                            div()
+                                .id("share-entire-screen-button")
+                                .w_full()
+                                .flex_none()
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(rgb(0x1f2933))
+                                .bg(rgb(0xffffff))
+                                .px_4()
+                                .py_2()
+                                .text_lg()
+                                .text_center()
+                                .child("Entire screen")
+                                .hover(|style| style.bg(rgb(0xebe7e1))),
+                        ),
+                )
+                .into_any_element()
+        })
     }
 
     fn connect_button_label(&self) -> &'static str {
@@ -477,65 +537,36 @@ impl PommeApp {
     }
 }
 
-struct ShareWindow;
-
-impl Render for ShareWindow {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .bg(rgb(0xf7f5f2))
-            .p_4()
-            .text_color(rgb(0x1f2933))
-            .child(
-                div()
-                    .id("share-source-grid")
-                    .grid()
-                    .grid_cols(2)
-                    .gap_3()
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .children((1_usize..=8).map(|index| {
-                        div()
-                            .id(("share-source-placeholder", index))
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .rounded_lg()
-                            .border_1()
-                            .border_color(rgb(0xd1d5db))
-                            .bg(rgb(0xffffff))
-                            .p_3()
-                            .hover(|style| style.bg(rgb(0xf9fafb)).border_color(rgb(0x1f2933)))
-                            .on_click(|_, _, _| {})
-                            .child(div().h(px(92.0)).w_full().rounded_md().bg(rgb(0xe5e7eb)))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(0x4b5563))
-                                    .child(format!("Window {index}")),
-                            )
-                    })),
-            )
-            .child(
-                div()
-                    .id("share-entire-screen-button")
-                    .w_full()
-                    .flex_none()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(0x1f2933))
-                    .bg(rgb(0xffffff))
-                    .px_4()
-                    .py_2()
-                    .text_lg()
-                    .text_center()
-                    .child("Entire screen")
-                    .hover(|style| style.bg(rgb(0xebe7e1))),
-            )
-    }
+fn render_share_source_grid() -> AnyElement {
+    div()
+        .id("share-source-grid")
+        .grid()
+        .grid_cols(2)
+        .gap_3()
+        .flex_1()
+        .overflow_y_scroll()
+        .children((1_usize..=8).map(|index| {
+            div()
+                .id(("share-source-placeholder", index))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(0xd1d5db))
+                .bg(rgb(0xffffff))
+                .p_3()
+                .hover(|style| style.bg(rgb(0xf9fafb)).border_color(rgb(0x1f2933)))
+                .on_click(|_, _, _| {})
+                .child(div().h(px(92.0)).w_full().rounded_md().bg(rgb(0xe5e7eb)))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(0x4b5563))
+                        .child(format!("Window {index}")),
+                )
+        }))
+        .into_any_element()
 }
 
 enum ReceiveEvent {
