@@ -127,6 +127,9 @@ mod media_foundation {
                 output_type
                     .SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_ratio(1, 1))
                     .map_err(format_windows_error)?;
+                output_type
+                    .SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)
+                    .map_err(format_windows_error)?;
                 transform
                     .SetOutputType(0, &output_type, 0)
                     .map_err(format_windows_error)?;
