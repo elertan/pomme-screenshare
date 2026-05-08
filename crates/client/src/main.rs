@@ -3,7 +3,7 @@ mod video;
 
 use std::{
     io::{self, Read, Write},
-    net::TcpStream,
+    net::{Shutdown, TcpStream},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -38,8 +38,6 @@ struct PommeApp {
     frame: Option<VideoFrame>,
 }
 
-const MESSAGE_TYPE_PING: u8 = 0;
-const MESSAGE_TYPE_VIDEO: u8 = 1;
 const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const FRAME_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const FRAME_STALE_TIMEOUT: Duration = Duration::from_millis(500);
@@ -60,11 +58,32 @@ enum ConnectionStatus {
     Failed(String),
 }
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MessageType {
+    Ping = 0,
+    Video = 1,
+    Disconnect = 2,
+}
+
+impl TryFrom<u8> for MessageType {
+    type Error = String;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Ping),
+            1 => Ok(Self::Video),
+            2 => Ok(Self::Disconnect),
+            unknown => Err(format!("unknown message type: {unknown}")),
+        }
+    }
+}
+
 impl Render for PommeApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         match self.view {
             AppView::Connect => self.render_connect(cx),
-            AppView::Connected => self.render_connected(),
+            AppView::Connected => self.render_connected(cx),
         }
     }
 }
@@ -120,11 +139,65 @@ impl PommeApp {
             .into_any_element()
     }
 
-    fn render_connected(&self) -> AnyElement {
+    fn render_connected(&self, cx: &mut Context<Self>) -> AnyElement {
         div()
             .size_full()
+            .flex()
+            .flex_col()
             .bg(rgb(0x000000))
-            .child(VideoCanvas::new(self.frame.clone()))
+            .child(
+                div()
+                    .id("video-pane")
+                    .flex_1()
+                    .w_full()
+                    .child(VideoCanvas::new(self.frame.clone())),
+            )
+            .child(
+                div()
+                    .id("connected-toolbar")
+                    .h(px(64.0))
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .gap_3()
+                    .bg(rgb(0xf7f5f2))
+                    .child(
+                        div()
+                            .id("disconnect-button")
+                            .w(px(160.0))
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(rgb(0x1f2933))
+                            .bg(rgb(0xffffff))
+                            .px_4()
+                            .py_2()
+                            .text_lg()
+                            .text_center()
+                            .text_color(rgb(0x1f2933))
+                            .child("Disconnect")
+                            .hover(|style| style.bg(rgb(0xebe7e1)))
+                            .on_click(cx.listener(|app, _, _, cx| {
+                                app.disconnect(cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("share-button")
+                            .w(px(160.0))
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(rgb(0x1f2933))
+                            .bg(rgb(0xffffff))
+                            .px_4()
+                            .py_2()
+                            .text_lg()
+                            .text_center()
+                            .text_color(rgb(0x1f2933))
+                            .child("Share...")
+                            .hover(|style| style.bg(rgb(0xebe7e1))),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -262,7 +335,7 @@ impl PommeApp {
         let heartbeat = cx.background_spawn(async move {
             loop {
                 Timer::after(Duration::from_secs(2)).await;
-                write_message(&mut connection, MESSAGE_TYPE_PING, &[])
+                write_message(&mut connection, MessageType::Ping, &[])
                     .map_err(|error| error.to_string())?;
             }
         });
@@ -297,7 +370,7 @@ impl PommeApp {
                     let bitstream = encoder.encode(&frame).map_err(|error| error.to_string())?;
                     let payload = bitstream.to_vec();
                     if !payload.is_empty() {
-                        write_message(&mut connection, MESSAGE_TYPE_VIDEO, &payload)
+                        write_message(&mut connection, MessageType::Video, &payload)
                             .map_err(|error| error.to_string())?;
                     }
                 }
@@ -324,6 +397,23 @@ impl PommeApp {
         self.frame = None;
         self.view = AppView::Connect;
         self.connection_status = ConnectionStatus::Failed(message);
+        self.server_input
+            .update(cx, |input, _| input.set_disabled(false));
+        cx.notify();
+    }
+
+    fn disconnect(&mut self, cx: &mut Context<Self>) {
+        if let Some(mut connection) = self.connection.take() {
+            let _ = write_message(&mut connection, MessageType::Disconnect, &[]);
+            let _ = connection.shutdown(Shutdown::Both);
+        }
+
+        self.keepalive_task = None;
+        self.receive_task = None;
+        self.send_task = None;
+        self.frame = None;
+        self.view = AppView::Connect;
+        self.connection_status = ConnectionStatus::Idle;
         self.server_input
             .update(cx, |input, _| input.set_disabled(false));
         cx.notify();
@@ -376,10 +466,14 @@ fn red_test_frame() -> YUVBuffer {
     YUVBuffer::from_rgb8_source(RgbSliceU8::new(&rgb, (STREAM_WIDTH, STREAM_HEIGHT)))
 }
 
-fn write_message(writer: &mut impl Write, message_type: u8, payload: &[u8]) -> io::Result<()> {
+fn write_message(
+    writer: &mut impl Write,
+    message_type: MessageType,
+    payload: &[u8],
+) -> io::Result<()> {
     let len = payload.len() + 1;
     writer.write_all(&(len as u32).to_be_bytes())?;
-    writer.write_all(&[message_type])?;
+    writer.write_all(&[message_type as u8])?;
     writer.write_all(payload)?;
     writer.flush()
 }
@@ -422,8 +516,9 @@ fn decode_frames(
         let Some((&message_type, payload)) = message.split_first() else {
             continue;
         };
+        let message_type = MessageType::try_from(message_type)?;
 
-        if message_type != MESSAGE_TYPE_VIDEO {
+        if message_type != MessageType::Video {
             continue;
         }
 

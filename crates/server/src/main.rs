@@ -19,12 +19,35 @@ use tokio::{
 const BIND_ADDR: &str = "0.0.0.0:1337";
 const MAX_PACKET_BYTES: usize = 16 * 1024 * 1024;
 const BROADCAST_CAPACITY: usize = 512;
-const MESSAGE_TYPE_PING: u8 = 0;
-const MESSAGE_TYPE_VIDEO: u8 = 1;
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MessageType {
+    Ping = 0,
+    Video = 1,
+    Disconnect = 2,
+}
+
+impl TryFrom<u8> for MessageType {
+    type Error = io::Error;
+
+    fn try_from(value: u8) -> io::Result<Self> {
+        match value {
+            0 => Ok(Self::Ping),
+            1 => Ok(Self::Video),
+            2 => Ok(Self::Disconnect),
+            unknown => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown message type: {unknown}"),
+            )),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
-struct VideoPacket {
+struct RelayedMessage {
     sender_id: u64,
+    message_type: MessageType,
     payload: Arc<[u8]>,
 }
 
@@ -38,7 +61,7 @@ fn main() -> io::Result<()> {
 async fn run_server() -> io::Result<()> {
     let listener = TcpListener::bind(BIND_ADDR).await?;
     let next_client_id = AtomicU64::new(1);
-    let (packet_tx, _) = broadcast::channel::<VideoPacket>(BROADCAST_CAPACITY);
+    let (message_tx, _) = broadcast::channel::<RelayedMessage>(BROADCAST_CAPACITY);
 
     eprintln!("pomme-screenshare-server listening on {BIND_ADDR}");
 
@@ -52,8 +75,8 @@ async fn run_server() -> io::Result<()> {
             client_id,
             peer_addr,
             stream,
-            packet_tx.clone(),
-            packet_tx.subscribe(),
+            message_tx.clone(),
+            message_tx.subscribe(),
         ));
     }
 }
@@ -62,20 +85,20 @@ async fn handle_client(
     client_id: u64,
     peer_addr: SocketAddr,
     stream: TcpStream,
-    packet_tx: broadcast::Sender<VideoPacket>,
-    mut packet_rx: broadcast::Receiver<VideoPacket>,
+    message_tx: broadcast::Sender<RelayedMessage>,
+    mut message_rx: broadcast::Receiver<RelayedMessage>,
 ) {
     let (mut reader, mut writer) = stream.into_split();
     let (done_tx, mut done_rx) = mpsc::channel(2);
 
     let read_done_tx = done_tx.clone();
     let read_task = tokio::spawn(async move {
-        let result = read_from_client(client_id, &mut reader, packet_tx).await;
+        let result = read_from_client(client_id, &mut reader, message_tx).await;
         let _ = read_done_tx.send(("read", result)).await;
     });
 
     let write_task = tokio::spawn(async move {
-        let result = write_to_client(client_id, &mut writer, &mut packet_rx).await;
+        let result = write_to_client(client_id, &mut writer, &mut message_rx).await;
         let _ = done_tx.send(("write", result)).await;
     });
 
@@ -96,7 +119,7 @@ async fn handle_client(
 async fn read_from_client<R>(
     client_id: u64,
     reader: &mut R,
-    packet_tx: broadcast::Sender<VideoPacket>,
+    message_tx: broadcast::Sender<RelayedMessage>,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -109,25 +132,22 @@ where
         let Some((&message_type, payload)) = payload.split_first() else {
             continue;
         };
+        let message_type = MessageType::try_from(message_type)?;
 
         match message_type {
-            MESSAGE_TYPE_PING => continue,
-            MESSAGE_TYPE_VIDEO => {
-                if packet_tx
-                    .send(VideoPacket {
+            MessageType::Ping => continue,
+            MessageType::Disconnect => return Ok(()),
+            MessageType::Video => {
+                if message_tx
+                    .send(RelayedMessage {
                         sender_id: client_id,
+                        message_type,
                         payload: payload.into(),
                     })
                     .is_err()
                 {
                     return Ok(());
                 }
-            }
-            unknown => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("unknown message type: {unknown}"),
-                ));
             }
         }
     }
@@ -136,14 +156,14 @@ where
 async fn write_to_client<W>(
     client_id: u64,
     writer: &mut W,
-    packet_rx: &mut broadcast::Receiver<VideoPacket>,
+    message_rx: &mut broadcast::Receiver<RelayedMessage>,
 ) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
     loop {
-        let packet = match packet_rx.recv().await {
-            Ok(packet) => packet,
+        let message = match message_rx.recv().await {
+            Ok(message) => message,
             Err(RecvError::Lagged(skipped)) => {
                 eprintln!("client {client_id} skipped {skipped} packets");
                 continue;
@@ -151,14 +171,14 @@ where
             Err(RecvError::Closed) => return Ok(()),
         };
 
-        if packet.sender_id == client_id {
+        if message.sender_id == client_id {
             continue;
         }
 
-        let mut message = Vec::with_capacity(packet.payload.len() + 1);
-        message.push(MESSAGE_TYPE_VIDEO);
-        message.extend_from_slice(&packet.payload);
-        write_packet(writer, &message).await?;
+        let mut payload = Vec::with_capacity(message.payload.len() + 1);
+        payload.push(message.message_type as u8);
+        payload.extend_from_slice(&message.payload);
+        write_packet(writer, &payload).await?;
     }
 }
 
