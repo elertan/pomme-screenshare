@@ -13,7 +13,12 @@ use gpui::{
     IntoElement, KeyBinding, ParentElement, Render, StatefulInteractiveElement, Styled, Task,
     Timer, Window, WindowBounds, WindowOptions, div, px, rgb, size,
 };
-use openh264::{decoder::Decoder, formats::YUVSource};
+use openh264::{
+    OpenH264API,
+    decoder::Decoder,
+    encoder::{BitRate, Encoder, EncoderConfig, FrameRate, RateControlMode, UsageType},
+    formats::{RgbSliceU8, YUVBuffer, YUVSource},
+};
 use text_input::{
     Backspace, Copy, Cut, Delete, Left, Paste, Right, SelectAll, SelectLeft, SelectRight, TextInput,
 };
@@ -27,6 +32,7 @@ struct PommeApp {
     connect_task: Option<Task<()>>,
     keepalive_task: Option<Task<()>>,
     receive_task: Option<Task<()>>,
+    send_task: Option<Task<()>>,
     frame: Option<VideoFrame>,
 }
 
@@ -34,6 +40,11 @@ const MESSAGE_TYPE_PING: u8 = 0;
 const MESSAGE_TYPE_VIDEO: u8 = 1;
 const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const FRAME_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const STREAM_WIDTH: usize = 800;
+const STREAM_HEIGHT: usize = 600;
+const STREAM_FPS: u64 = 30;
+const STREAM_FRAME_INTERVAL: Duration = Duration::from_millis(1000 / STREAM_FPS);
+const STREAM_BITRATE_BPS: u32 = 2_000_000;
 
 enum AppView {
     Connect,
@@ -57,7 +68,7 @@ impl Render for PommeApp {
 
 impl PommeApp {
     fn new(cx: &mut Context<Self>) -> Self {
-        let server_input = cx.new(|cx| TextInput::new("127.0.0.1", "Server IP", cx));
+        let server_input = cx.new(|cx| TextInput::new("192.168.1.125", "Server IP", cx));
 
         Self {
             view: AppView::Connect,
@@ -67,6 +78,7 @@ impl PommeApp {
             connect_task: None,
             keepalive_task: None,
             receive_task: None,
+            send_task: None,
             frame: None,
         }
     }
@@ -148,16 +160,25 @@ impl PommeApp {
                 match result {
                     Ok(connection) => {
                         let _ = connection.set_nodelay(true);
-                        match (connection.try_clone(), connection.try_clone()) {
-                            (Ok(keepalive_connection), Ok(receive_connection)) => {
+                        match (
+                            connection.try_clone(),
+                            connection.try_clone(),
+                            connection.try_clone(),
+                        ) {
+                            (
+                                Ok(keepalive_connection),
+                                Ok(receive_connection),
+                                Ok(send_connection),
+                            ) => {
                                 app.connection = Some(connection);
                                 app.connection_status = ConnectionStatus::Idle;
                                 app.view = AppView::Connected;
                                 app.start_keepalive(keepalive_connection, cx);
                                 app.start_receiver(receive_connection, cx);
+                                app.start_red_stream(send_connection, cx);
                                 cx.notify();
                             }
-                            (Err(error), _) | (_, Err(error)) => {
+                            (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
                                 app.connection_status = ConnectionStatus::Failed(format!(
                                     "Failed to hold connection: {error}"
                                 ));
@@ -235,10 +256,45 @@ impl PommeApp {
         }));
     }
 
+    fn start_red_stream(&mut self, mut connection: TcpStream, cx: &mut Context<Self>) {
+        let sender = cx.background_spawn(async move {
+            let frame = red_test_frame();
+            let config = EncoderConfig::new()
+                .usage_type(UsageType::ScreenContentRealTime)
+                .bitrate(BitRate::from_bps(STREAM_BITRATE_BPS))
+                .max_frame_rate(FrameRate::from_hz(STREAM_FPS as f32))
+                .rate_control_mode(RateControlMode::Bitrate);
+            let api = OpenH264API::from_source();
+            let mut encoder =
+                Encoder::with_api_config(api, config).map_err(|error| error.to_string())?;
+
+            loop {
+                {
+                    let bitstream = encoder.encode(&frame).map_err(|error| error.to_string())?;
+                    let payload = bitstream.to_vec();
+                    write_message(&mut connection, MESSAGE_TYPE_VIDEO, &payload)
+                        .map_err(|error| error.to_string())?;
+                }
+                Timer::after(STREAM_FRAME_INTERVAL).await;
+            }
+        });
+
+        self.send_task = Some(cx.spawn(async move |app, cx| {
+            let result: Result<(), String> = sender.await;
+
+            let _ = app.update(cx, |app, cx| {
+                if let Err(message) = result {
+                    app.connection_lost(format!("Connection lost: {message}"), cx);
+                }
+            });
+        }));
+    }
+
     fn connection_lost(&mut self, message: String, cx: &mut Context<Self>) {
         self.connection = None;
         self.keepalive_task = None;
         self.receive_task = None;
+        self.send_task = None;
         self.frame = None;
         self.view = AppView::Connect;
         self.connection_status = ConnectionStatus::Failed(message);
@@ -283,6 +339,15 @@ impl PommeApp {
 enum ReceiveEvent {
     Frame(CpuRgbaFrame),
     Error(String),
+}
+
+fn red_test_frame() -> YUVBuffer {
+    let mut rgb = Vec::with_capacity(STREAM_WIDTH * STREAM_HEIGHT * 3);
+    for _ in 0..STREAM_WIDTH * STREAM_HEIGHT {
+        rgb.extend_from_slice(&[255, 0, 0]);
+    }
+
+    YUVBuffer::from_rgb8_source(RgbSliceU8::new(&rgb, (STREAM_WIDTH, STREAM_HEIGHT)))
 }
 
 fn write_message(writer: &mut impl Write, message_type: u8, payload: &[u8]) -> io::Result<()> {
