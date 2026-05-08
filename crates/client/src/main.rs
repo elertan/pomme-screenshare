@@ -11,7 +11,7 @@ use std::{
 use gpui::{
     AnyElement, App, AppContext, Application, Bounds, Context, Entity, InteractiveElement,
     IntoElement, KeyBinding, ParentElement, Render, StatefulInteractiveElement, Styled, Task,
-    Timer, Window, WindowBounds, WindowOptions, div, px, rgb, size,
+    Timer, Window, WindowBounds, WindowKind, WindowOptions, div, px, rgb, size,
 };
 use openh264::{
     OpenH264API,
@@ -195,7 +195,10 @@ impl PommeApp {
                             .text_center()
                             .text_color(rgb(0x1f2933))
                             .child("Share...")
-                            .hover(|style| style.bg(rgb(0xebe7e1))),
+                            .hover(|style| style.bg(rgb(0xebe7e1)))
+                            .on_click(cx.listener(|app, _, _, cx| {
+                                app.open_share_window(cx);
+                            })),
                     ),
             )
             .into_any_element()
@@ -419,6 +422,28 @@ impl PommeApp {
         cx.notify();
     }
 
+    fn open_share_window(&mut self, cx: &mut Context<Self>) {
+        let bounds = Bounds::centered(None, size(px(520.0), px(420.0)), cx);
+        let window = cx.open_window(
+            WindowOptions {
+                titlebar: Some(gpui::TitlebarOptions {
+                    title: Some("Share...".into()),
+                    ..Default::default()
+                }),
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                kind: WindowKind::Floating,
+                is_resizable: false,
+                is_minimizable: false,
+                ..Default::default()
+            },
+            |_, cx| cx.new(|_| ShareWindow),
+        );
+
+        if let Ok(window) = window {
+            let _ = window.update(cx, |_, window, _| window.activate_window());
+        }
+    }
+
     fn connect_button_label(&self) -> &'static str {
         match self.connection_status {
             ConnectionStatus::Connecting => "Connecting...",
@@ -449,6 +474,67 @@ impl PommeApp {
                     .into_any_element(),
             ),
         }
+    }
+}
+
+struct ShareWindow;
+
+impl Render for ShareWindow {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .bg(rgb(0xf7f5f2))
+            .p_4()
+            .text_color(rgb(0x1f2933))
+            .child(
+                div()
+                    .id("share-source-grid")
+                    .grid()
+                    .grid_cols(2)
+                    .gap_3()
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .children((1_usize..=8).map(|index| {
+                        div()
+                            .id(("share-source-placeholder", index))
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(rgb(0xd1d5db))
+                            .bg(rgb(0xffffff))
+                            .p_3()
+                            .hover(|style| style.bg(rgb(0xf9fafb)).border_color(rgb(0x1f2933)))
+                            .on_click(|_, _, _| {})
+                            .child(div().h(px(92.0)).w_full().rounded_md().bg(rgb(0xe5e7eb)))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(0x4b5563))
+                                    .child(format!("Window {index}")),
+                            )
+                    })),
+            )
+            .child(
+                div()
+                    .id("share-entire-screen-button")
+                    .w_full()
+                    .flex_none()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(0x1f2933))
+                    .bg(rgb(0xffffff))
+                    .px_4()
+                    .py_2()
+                    .text_lg()
+                    .text_center()
+                    .child("Entire screen")
+                    .hover(|style| style.bg(rgb(0xebe7e1))),
+            )
     }
 }
 
