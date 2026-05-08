@@ -6,7 +6,8 @@ use std::{
     io::{self, Read, Write},
     net::{Shutdown, TcpStream},
     process,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, mpsc},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -395,44 +396,56 @@ impl PommeApp {
         mut connection: TcpStream,
         cx: &mut Context<Self>,
     ) {
-        let sender = cx.background_spawn(async move {
-            let mut source = ShareCaptureSource::new(source_id)?;
-            let mut encoder: Option<H264Encoder> = None;
-            let mut next_frame_at = Instant::now();
+        let (result_tx, result_rx) = mpsc::channel();
 
-            loop {
-                {
-                    let Some(frame) = source.capture_frame() else {
-                        return Ok(());
-                    };
+        thread::spawn(move || {
+            let result: Result<(), String> = (|| {
+                let mut source = ShareCaptureSource::new(source_id)?;
+                let mut encoder: Option<H264Encoder> = None;
+                let mut next_frame_at = Instant::now();
 
-                    let encoder = match encoder.as_mut() {
-                        Some(encoder) if encoder.dimensions() == frame.dimensions() => encoder,
-                        _ => {
-                            encoder = Some(H264Encoder::new(
-                                frame.dimensions(),
-                                STREAM_FPS as u32,
-                                STREAM_BITRATE_BPS,
-                            )?);
-                            encoder.as_mut().expect("encoder just initialized")
+                loop {
+                    {
+                        let Some(frame) = source.capture_frame() else {
+                            return Ok(());
+                        };
+
+                        let encoder = match encoder.as_mut() {
+                            Some(encoder) if encoder.dimensions() == frame.dimensions() => encoder,
+                            _ => {
+                                encoder = Some(H264Encoder::new(
+                                    frame.dimensions(),
+                                    STREAM_FPS as u32,
+                                    STREAM_BITRATE_BPS,
+                                )?);
+                                encoder.as_mut().expect("encoder just initialized")
+                            }
+                        };
+
+                        let payload = encoder.encode(&frame)?;
+                        if !payload.is_empty() {
+                            write_message(&mut connection, MessageType::Video, &payload)
+                                .map_err(|error| error.to_string())?;
                         }
-                    };
+                    }
 
-                    let payload = encoder.encode(&frame)?;
-                    if !payload.is_empty() {
-                        write_message(&mut connection, MessageType::Video, &payload)
-                            .map_err(|error| error.to_string())?;
+                    next_frame_at += STREAM_FRAME_INTERVAL;
+                    let now = Instant::now();
+                    if now < next_frame_at {
+                        thread::sleep(next_frame_at - now);
+                    } else if now.duration_since(next_frame_at) > STREAM_FRAME_INTERVAL {
+                        next_frame_at = now;
                     }
                 }
+            })();
 
-                next_frame_at += STREAM_FRAME_INTERVAL;
-                let now = Instant::now();
-                if now < next_frame_at {
-                    Timer::after(next_frame_at - now).await;
-                } else if now.duration_since(next_frame_at) > STREAM_FRAME_INTERVAL {
-                    next_frame_at = now;
-                }
-            }
+            let _ = result_tx.send(result);
+        });
+
+        let sender = cx.background_spawn(async move {
+            result_rx
+                .recv()
+                .unwrap_or_else(|_| Err("Share stream worker stopped".to_string()))
         });
 
         self.send_task = Some(cx.spawn(async move |app, cx| {
