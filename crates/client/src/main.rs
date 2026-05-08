@@ -1,7 +1,11 @@
 mod text_input;
 mod video;
 
-use std::{net::TcpStream, time::Duration};
+use std::{
+    io::{self, Write},
+    net::TcpStream,
+    time::Duration,
+};
 
 use gpui::{
     AnyElement, App, AppContext, Application, Bounds, Context, Entity, InteractiveElement,
@@ -19,9 +23,12 @@ struct PommeApp {
     connection_status: ConnectionStatus,
     connection: Option<TcpStream>,
     connect_task: Option<Task<()>>,
+    keepalive_task: Option<Task<()>>,
     frame: Option<VideoFrame>,
     stream_task: Option<Task<()>>,
 }
+
+const MESSAGE_TYPE_PING: u8 = 0;
 
 enum AppView {
     Connect,
@@ -53,6 +60,7 @@ impl PommeApp {
             connection_status: ConnectionStatus::Idle,
             connection: None,
             connect_task: None,
+            keepalive_task: None,
             frame: None,
             stream_task: None,
         }
@@ -164,10 +172,21 @@ impl PommeApp {
                 match result {
                     Ok(connection) => {
                         let _ = connection.set_nodelay(true);
-                        app.connection = Some(connection);
-                        app.connection_status = ConnectionStatus::Idle;
-                        app.view = AppView::Connected;
-                        app.start_fake_stream(cx);
+                        match connection.try_clone() {
+                            Ok(keepalive_connection) => {
+                                app.connection = Some(connection);
+                                app.connection_status = ConnectionStatus::Idle;
+                                app.view = AppView::Connected;
+                                app.start_keepalive(keepalive_connection, cx);
+                                app.start_fake_stream(cx);
+                            }
+                            Err(error) => {
+                                app.connection_status = ConnectionStatus::Failed(format!(
+                                    "Failed to hold connection: {error}"
+                                ));
+                                cx.notify();
+                            }
+                        }
                     }
                     Err(message) => {
                         app.connection_status =
@@ -177,6 +196,38 @@ impl PommeApp {
                 }
             });
         }));
+    }
+
+    fn start_keepalive(&mut self, mut connection: TcpStream, cx: &mut Context<Self>) {
+        let heartbeat = cx.background_spawn(async move {
+            loop {
+                Timer::after(Duration::from_secs(2)).await;
+                write_message(&mut connection, MESSAGE_TYPE_PING, &[])
+                    .map_err(|error| error.to_string())?;
+            }
+        });
+
+        self.keepalive_task = Some(cx.spawn(async move |app, cx| {
+            let result: Result<(), String> = heartbeat.await;
+
+            let _ = app.update(cx, |app, cx| {
+                if let Err(message) = result {
+                    app.connection_lost(format!("Connection lost: {message}"), cx);
+                }
+            });
+        }));
+    }
+
+    fn connection_lost(&mut self, message: String, cx: &mut Context<Self>) {
+        self.connection = None;
+        self.keepalive_task = None;
+        self.stream_task = None;
+        self.frame = None;
+        self.view = AppView::Connect;
+        self.connection_status = ConnectionStatus::Failed(message);
+        self.server_input
+            .update(cx, |input, _| input.set_disabled(false));
+        cx.notify();
     }
 
     fn connect_button_label(&self) -> &'static str {
@@ -210,6 +261,14 @@ impl PommeApp {
             ),
         }
     }
+}
+
+fn write_message(writer: &mut impl Write, message_type: u8, payload: &[u8]) -> io::Result<()> {
+    let len = payload.len() + 1;
+    writer.write_all(&(len as u32).to_be_bytes())?;
+    writer.write_all(&[message_type])?;
+    writer.write_all(payload)?;
+    writer.flush()
 }
 
 fn main() {

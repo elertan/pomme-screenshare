@@ -19,6 +19,8 @@ use tokio::{
 const BIND_ADDR: &str = "0.0.0.0:1337";
 const MAX_PACKET_BYTES: usize = 16 * 1024 * 1024;
 const BROADCAST_CAPACITY: usize = 512;
+const MESSAGE_TYPE_PING: u8 = 0;
+const MESSAGE_TYPE_VIDEO: u8 = 1;
 
 #[derive(Clone, Debug)]
 struct VideoPacket {
@@ -104,14 +106,29 @@ where
             return Ok(());
         };
 
-        if packet_tx
-            .send(VideoPacket {
-                sender_id: client_id,
-                payload: payload.into(),
-            })
-            .is_err()
-        {
-            return Ok(());
+        let Some((&message_type, payload)) = payload.split_first() else {
+            continue;
+        };
+
+        match message_type {
+            MESSAGE_TYPE_PING => continue,
+            MESSAGE_TYPE_VIDEO => {
+                if packet_tx
+                    .send(VideoPacket {
+                        sender_id: client_id,
+                        payload: payload.into(),
+                    })
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            }
+            unknown => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unknown message type: {unknown}"),
+                ));
+            }
         }
     }
 }
@@ -138,7 +155,10 @@ where
             continue;
         }
 
-        write_packet(writer, &packet.payload).await?;
+        let mut message = Vec::with_capacity(packet.payload.len() + 1);
+        message.push(MESSAGE_TYPE_VIDEO);
+        message.extend_from_slice(&packet.payload);
+        write_packet(writer, &message).await?;
     }
 }
 
