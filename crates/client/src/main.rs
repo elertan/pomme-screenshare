@@ -19,7 +19,8 @@ use openh264::{
     OpenH264API,
     decoder::Decoder,
     encoder::{
-        BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode, UsageType,
+        BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode,
+        UsageType,
     },
     formats::{RgbaSliceU8, YUVBuffer, YUVSource},
 };
@@ -405,10 +406,15 @@ impl PommeApp {
                 .max_frame_rate(FrameRate::from_hz(STREAM_FPS as f32))
                 .rate_control_mode(RateControlMode::Bitrate)
                 .intra_frame_period(IntraFramePeriod::from_num_frames(STREAM_FPS as u32))
+                .complexity(Complexity::Low)
+                .scene_change_detect(false)
+                .adaptive_quantization(false)
+                .background_detection(false)
                 .skip_frames(false);
             let api = OpenH264API::from_source();
             let mut encoder =
                 Encoder::with_api_config(api, config).map_err(|error| error.to_string())?;
+            let mut next_frame_at = Instant::now();
 
             loop {
                 {
@@ -423,7 +429,14 @@ impl PommeApp {
                             .map_err(|error| error.to_string())?;
                     }
                 }
-                Timer::after(STREAM_FRAME_INTERVAL).await;
+
+                next_frame_at += STREAM_FRAME_INTERVAL;
+                let now = Instant::now();
+                if now < next_frame_at {
+                    Timer::after(next_frame_at - now).await;
+                } else if now.duration_since(next_frame_at) > STREAM_FRAME_INTERVAL {
+                    next_frame_at = now;
+                }
             }
         });
 
