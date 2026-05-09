@@ -1167,7 +1167,7 @@ fn normalize_preview_image(image: RgbaImage) -> RgbaImage {
 
 #[cfg(target_os = "windows")]
 fn bgra_image_to_rgba(mut image: RgbaImage) -> RgbaImage {
-    for pixel in image.as_mut().chunks_exact_mut(4) {
+    for pixel in image.as_raw_mut().chunks_exact_mut(4) {
         pixel.swap(0, 2);
     }
     image
