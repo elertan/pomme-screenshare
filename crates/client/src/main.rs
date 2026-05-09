@@ -1165,7 +1165,9 @@ fn capture_application_audio(
 ) -> Result<(), String> {
     use wasapi::{AudioClient, Direction, SampleType, StreamMode, WaveFormat, initialize_mta};
 
-    initialize_mta().map_err(|error| format!("WASAPI init failed: {error}"))?;
+    initialize_mta()
+        .ok()
+        .map_err(|error| format!("WASAPI init failed: {error}"))?;
 
     let desired_format = WaveFormat::new(
         32,
