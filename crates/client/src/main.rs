@@ -18,7 +18,7 @@ use gpui::{
 };
 use image::{Frame as ImageFrame, RgbaImage};
 #[cfg(target_os = "windows")]
-use openh264::formats::RgbaSliceU8;
+use openh264::formats::BgraSliceU8;
 use openh264::{
     OpenH264API,
     decoder::Decoder,
@@ -848,7 +848,7 @@ impl windows_capture::capture::GraphicsCaptureApiHandler for WindowsShareCapture
         let pixels = buffer
             .as_nopadding_buffer()
             .map_err(|error| error.to_string())?;
-        if let Some(frame) = rgba_bytes_to_yuv(pixels, width, height) {
+        if let Some(frame) = bgra_bytes_to_yuv(pixels, width, height) {
             let (latest_frame, frame_ready) = &*self.latest_frame;
             if let Ok(mut latest_frame) = latest_frame.lock() {
                 *latest_frame = Some(frame);
@@ -896,7 +896,7 @@ impl ShareCaptureSource {
 }
 
 #[cfg(target_os = "windows")]
-fn rgba_bytes_to_yuv(bytes: &[u8], width: u32, height: u32) -> Option<YUVBuffer> {
+fn bgra_bytes_to_yuv(bytes: &[u8], width: u32, height: u32) -> Option<YUVBuffer> {
     let width = width & !1;
     let height = height & !1;
     if width == 0 || height == 0 {
@@ -904,7 +904,7 @@ fn rgba_bytes_to_yuv(bytes: &[u8], width: u32, height: u32) -> Option<YUVBuffer>
     }
 
     let dimensions = (width as usize, height as usize);
-    Some(YUVBuffer::from_rgb_source(RgbaSliceU8::new(
+    Some(YUVBuffer::from_rgb_source(BgraSliceU8::new(
         bytes, dimensions,
     )))
 }
