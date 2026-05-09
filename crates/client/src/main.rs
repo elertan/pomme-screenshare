@@ -1166,11 +1166,14 @@ fn normalize_preview_image(image: RgbaImage) -> RgbaImage {
 }
 
 #[cfg(target_os = "windows")]
-fn bgra_image_to_rgba(mut image: RgbaImage) -> RgbaImage {
-    for pixel in image.as_raw_mut().chunks_exact_mut(4) {
+fn bgra_image_to_rgba(image: RgbaImage) -> RgbaImage {
+    let width = image.width();
+    let height = image.height();
+    let mut pixels = image.into_raw();
+    for pixel in pixels.chunks_exact_mut(4) {
         pixel.swap(0, 2);
     }
-    image
+    RgbaImage::from_raw(width, height, pixels).unwrap_or_else(|| RgbaImage::new(width, height))
 }
 
 fn should_hide_share_source(title: &str, app_name: &str, width: u32, height: u32) -> bool {
