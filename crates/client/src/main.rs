@@ -4,6 +4,7 @@ mod video;
 #[cfg(target_os = "windows")]
 use std::sync::Condvar;
 use std::{
+    collections::VecDeque,
     io::{self, Read, Write},
     net::{Shutdown, TcpStream},
     process,
@@ -11,6 +12,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use cpal::{
+    FromSample, Sample, SampleFormat, SizedSample,
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+};
 use gpui::{
     AnyElement, App, AppContext, Application, Bounds, Context, Entity, InteractiveElement,
     IntoElement, KeyBinding, ParentElement, Render, StatefulInteractiveElement, Styled,
@@ -38,10 +43,12 @@ struct PommeApp {
     server_input: Entity<TextInput>,
     connection_status: ConnectionStatus,
     connection: Option<TcpStream>,
+    writer: Option<Arc<Mutex<TcpStream>>>,
     connect_task: Option<Task<()>>,
     keepalive_task: Option<Task<()>>,
     receive_task: Option<Task<()>>,
     send_task: Option<Task<()>>,
+    audio_send_task: Option<Task<()>>,
     share_sources_task: Option<Task<()>>,
     share_sources: ShareSources,
     frame: Option<VideoFrame>,
@@ -59,6 +66,15 @@ const STREAM_TARGET_QP_MIN: u8 = 18;
 const STREAM_TARGET_QP_MAX: u8 = 42;
 const STREAM_DEGRADED_QP_MIN: u8 = 24;
 const STREAM_DEGRADED_QP_MAX: u8 = 46;
+const AUDIO_SAMPLE_RATE: u32 = 48_000;
+const AUDIO_CHANNELS: usize = 2;
+#[cfg(target_os = "windows")]
+const AUDIO_FRAME_MS: usize = 20;
+#[cfg(target_os = "windows")]
+const AUDIO_SAMPLES_PER_CHANNEL: usize = AUDIO_SAMPLE_RATE as usize * AUDIO_FRAME_MS / 1000;
+#[cfg(target_os = "windows")]
+const AUDIO_SAMPLES_PER_PACKET: usize = AUDIO_SAMPLES_PER_CHANNEL * AUDIO_CHANNELS;
+const TIMESTAMP_BYTES: usize = 8;
 #[cfg(target_os = "windows")]
 const STREAM_CAPTURE_INTERVAL: Duration = Duration::from_millis(1000 / STREAM_TARGET_FPS as u64);
 
@@ -331,6 +347,7 @@ enum ShareSources {
 #[derive(Clone)]
 struct ShareSource {
     id: u32,
+    pid: u32,
     title: String,
     app_name: String,
     preview: Option<ShareSourcePreview>,
@@ -350,6 +367,7 @@ enum MessageType {
     Ping = 0,
     Video = 1,
     Disconnect = 2,
+    Audio = 3,
 }
 
 impl TryFrom<u8> for MessageType {
@@ -360,6 +378,7 @@ impl TryFrom<u8> for MessageType {
             0 => Ok(Self::Ping),
             1 => Ok(Self::Video),
             2 => Ok(Self::Disconnect),
+            3 => Ok(Self::Audio),
             unknown => Err(format!("unknown message type: {unknown}")),
         }
     }
@@ -383,10 +402,12 @@ impl PommeApp {
             server_input,
             connection_status: ConnectionStatus::Idle,
             connection: None,
+            writer: None,
             connect_task: None,
             keepalive_task: None,
             receive_task: None,
             send_task: None,
+            audio_send_task: None,
             share_sources_task: None,
             share_sources: ShareSources::Idle,
             frame: None,
@@ -531,11 +552,13 @@ impl PommeApp {
                     Ok(connection) => {
                         let _ = connection.set_nodelay(true);
                         match (connection.try_clone(), connection.try_clone()) {
-                            (Ok(keepalive_connection), Ok(receive_connection)) => {
+                            (Ok(writer_connection), Ok(receive_connection)) => {
+                                let writer = Arc::new(Mutex::new(writer_connection));
                                 app.connection = Some(connection);
+                                app.writer = Some(Arc::clone(&writer));
                                 app.connection_status = ConnectionStatus::Idle;
                                 app.view = AppView::Connected;
-                                app.start_keepalive(keepalive_connection, cx);
+                                app.start_keepalive(writer, cx);
                                 app.start_receiver(receive_connection, cx);
                                 cx.notify();
                             }
@@ -616,12 +639,11 @@ impl PommeApp {
         }));
     }
 
-    fn start_keepalive(&mut self, mut connection: TcpStream, cx: &mut Context<Self>) {
+    fn start_keepalive(&mut self, writer: Arc<Mutex<TcpStream>>, cx: &mut Context<Self>) {
         let heartbeat = cx.background_spawn(async move {
             loop {
                 Timer::after(Duration::from_secs(2)).await;
-                write_message(&mut connection, MessageType::Ping, &[])
-                    .map_err(|error| error.to_string())?;
+                write_locked_message(&writer, MessageType::Ping, &[])?;
             }
         });
 
@@ -636,25 +658,25 @@ impl PommeApp {
         }));
     }
 
-    fn start_share_source(&mut self, source_id: u32, cx: &mut Context<Self>) {
-        let Some(connection) = &self.connection else {
-            return;
-        };
-
-        let Ok(connection) = connection.try_clone() else {
+    fn start_share_source(&mut self, source_id: u32, source_pid: u32, cx: &mut Context<Self>) {
+        let Some(writer) = self.writer.clone() else {
             return;
         };
 
         self.send_task = None;
+        self.audio_send_task = None;
         self.share_modal_open = false;
-        self.start_share_stream(source_id, connection, cx);
+        let stream_started_at = Instant::now();
+        self.start_share_stream(source_id, Arc::clone(&writer), stream_started_at, cx);
+        self.start_audio_stream(source_pid, writer, stream_started_at, cx);
         cx.notify();
     }
 
     fn start_share_stream(
         &mut self,
         source_id: u32,
-        mut connection: TcpStream,
+        writer: Arc<Mutex<TcpStream>>,
+        stream_started_at: Instant,
         cx: &mut Context<Self>,
     ) {
         let sender = cx.background_spawn(async move {
@@ -674,14 +696,15 @@ impl PommeApp {
                     let wait_time = wait_started_at.elapsed();
 
                     let encode_started_at = Instant::now();
+                    let frame_timestamp = stream_started_at.elapsed();
                     let bitstream = encoder.encode(&frame).map_err(|error| error.to_string())?;
-                    let payload = bitstream.to_vec();
+                    let bitstream = bitstream.to_vec();
+                    let payload = encode_timed_payload(frame_timestamp, &bitstream);
                     let encode_time = encode_started_at.elapsed();
                     let mut write_time = Duration::ZERO;
-                    if !payload.is_empty() {
+                    if payload.len() > TIMESTAMP_BYTES {
                         let write_started_at = Instant::now();
-                        write_message(&mut connection, MessageType::Video, &payload)
-                            .map_err(|error| error.to_string())?;
+                        write_locked_message(&writer, MessageType::Video, &payload)?;
                         write_time = write_started_at.elapsed();
                     }
                     if let Some(snapshot) = stats.record(
@@ -746,11 +769,39 @@ impl PommeApp {
         }));
     }
 
+    fn start_audio_stream(
+        &mut self,
+        source_pid: u32,
+        writer: Arc<Mutex<TcpStream>>,
+        stream_started_at: Instant,
+        cx: &mut Context<Self>,
+    ) {
+        let sender = cx.background_spawn(async move {
+            capture_application_audio(source_pid, stream_started_at, |timestamp, pcm_packet| {
+                let payload = encode_audio_payload(timestamp, pcm_packet);
+                write_locked_message(&writer, MessageType::Audio, &payload)
+            })
+        });
+
+        self.audio_send_task = Some(cx.spawn(async move |app, cx| {
+            let result: Result<(), String> = sender.await;
+
+            if let Err(message) = result {
+                eprintln!("[share-audio] stopped: {message}");
+                let _ = app.update(cx, |app, _| {
+                    app.audio_send_task = None;
+                });
+            }
+        }));
+    }
+
     fn connection_lost(&mut self, message: String, cx: &mut Context<Self>) {
         self.connection = None;
+        self.writer = None;
         self.keepalive_task = None;
         self.receive_task = None;
         self.send_task = None;
+        self.audio_send_task = None;
         self.share_sources_task = None;
         self.frame = None;
         self.share_modal_open = false;
@@ -762,14 +813,21 @@ impl PommeApp {
     }
 
     fn disconnect(&mut self, cx: &mut Context<Self>) {
-        if let Some(mut connection) = self.connection.take() {
-            let _ = write_message(&mut connection, MessageType::Disconnect, &[]);
+        if let Some(writer) = self.writer.take()
+            && let Ok(mut writer) = writer.lock()
+        {
+            let _ = write_message(&mut *writer, MessageType::Disconnect, &[]);
+            let _ = writer.shutdown(Shutdown::Both);
+        }
+
+        if let Some(connection) = self.connection.take() {
             let _ = connection.shutdown(Shutdown::Both);
         }
 
         self.keepalive_task = None;
         self.receive_task = None;
         self.send_task = None;
+        self.audio_send_task = None;
         self.share_sources_task = None;
         self.frame = None;
         self.share_modal_open = false;
@@ -931,6 +989,46 @@ fn create_stream_encoder(settings: StreamSettings) -> Result<Encoder, String> {
     Encoder::with_api_config(api, config).map_err(|error| error.to_string())
 }
 
+fn encode_timed_payload(timestamp: Duration, payload: &[u8]) -> Vec<u8> {
+    let mut framed = Vec::with_capacity(TIMESTAMP_BYTES + payload.len());
+    framed.extend_from_slice(&(timestamp.as_micros() as u64).to_be_bytes());
+    framed.extend_from_slice(payload);
+    framed
+}
+
+fn split_timed_payload(payload: &[u8]) -> Option<(Duration, &[u8])> {
+    if payload.len() < TIMESTAMP_BYTES {
+        return None;
+    }
+    let (timestamp, payload) = payload.split_at(TIMESTAMP_BYTES);
+    let timestamp = u64::from_be_bytes(timestamp.try_into().ok()?);
+    Some((Duration::from_micros(timestamp), payload))
+}
+
+fn encode_audio_payload(timestamp: Duration, pcm_packet: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(TIMESTAMP_BYTES + 6 + pcm_packet.len());
+    payload.extend_from_slice(&(timestamp.as_micros() as u64).to_be_bytes());
+    payload.extend_from_slice(&AUDIO_SAMPLE_RATE.to_be_bytes());
+    payload.extend_from_slice(&(AUDIO_CHANNELS as u16).to_be_bytes());
+    payload.extend_from_slice(pcm_packet);
+    payload
+}
+
+fn split_audio_payload(payload: &[u8]) -> Option<(Duration, u32, usize, &[u8])> {
+    if payload.len() < TIMESTAMP_BYTES + 6 {
+        return None;
+    }
+    let timestamp = u64::from_be_bytes(payload[0..8].try_into().ok()?);
+    let sample_rate = u32::from_be_bytes(payload[8..12].try_into().ok()?);
+    let channels = u16::from_be_bytes(payload[12..14].try_into().ok()?) as usize;
+    Some((
+        Duration::from_micros(timestamp),
+        sample_rate,
+        channels,
+        &payload[14..],
+    ))
+}
+
 fn render_share_source_grid(sources: &ShareSources, cx: &mut Context<PommeApp>) -> AnyElement {
     match sources {
         ShareSources::Idle | ShareSources::Loading => div()
@@ -984,6 +1082,7 @@ fn render_share_source_grid(sources: &ShareSources, cx: &mut Context<PommeApp>) 
 
 fn render_share_source(source: &ShareSource, cx: &mut Context<PommeApp>) -> AnyElement {
     let source_id = source.id;
+    let source_pid = source.pid;
 
     div()
         .id(("share-source", source.id))
@@ -998,7 +1097,7 @@ fn render_share_source(source: &ShareSource, cx: &mut Context<PommeApp>) -> AnyE
         .p_3()
         .hover(|style| style.bg(rgb(0xf9fafb)).border_color(rgb(0x1f2933)))
         .on_click(cx.listener(move |app, _, _, cx| {
-            app.start_share_source(source_id, cx);
+            app.start_share_source(source_id, source_pid, cx);
         }))
         .child(render_share_source_preview(source))
         .child(
@@ -1056,6 +1155,101 @@ fn preview_placeholder(message: &str) -> AnyElement {
         .text_color(rgb(0x6b7280))
         .child(message.to_string())
         .into_any_element()
+}
+
+#[cfg(target_os = "windows")]
+fn capture_application_audio(
+    source_pid: u32,
+    stream_started_at: Instant,
+    mut on_packet: impl FnMut(Duration, &[u8]) -> Result<(), String>,
+) -> Result<(), String> {
+    use wasapi::{AudioClient, Direction, SampleType, StreamMode, WaveFormat, initialize_mta};
+
+    initialize_mta().map_err(|error| format!("WASAPI init failed: {error}"))?;
+
+    let desired_format = WaveFormat::new(
+        32,
+        32,
+        &SampleType::Float,
+        AUDIO_SAMPLE_RATE as usize,
+        AUDIO_CHANNELS,
+        None,
+    );
+    let block_align = desired_format.get_blockalign() as usize;
+    let mut client = AudioClient::new_application_loopback_client(source_pid, true)
+        .map_err(|error| error.to_string())?;
+    client
+        .initialize_client(
+            &desired_format,
+            &Direction::Capture,
+            &StreamMode::EventsShared {
+                autoconvert: true,
+                buffer_duration_hns: 0,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+
+    let event = client
+        .set_get_eventhandle()
+        .map_err(|error| error.to_string())?;
+    let capture = client
+        .get_audiocaptureclient()
+        .map_err(|error| error.to_string())?;
+    let mut sample_bytes = VecDeque::new();
+    let mut packet = Vec::with_capacity(AUDIO_SAMPLES_PER_PACKET * 2);
+    let packet_bytes = AUDIO_SAMPLES_PER_PACKET * 4;
+    eprintln!("[share-audio] started WASAPI process loopback pid={source_pid}");
+    client.start_stream().map_err(|error| error.to_string())?;
+
+    loop {
+        while sample_bytes.len() >= packet_bytes {
+            packet.clear();
+            for _ in 0..AUDIO_SAMPLES_PER_PACKET {
+                let bytes = [
+                    sample_bytes.pop_front().unwrap_or_default(),
+                    sample_bytes.pop_front().unwrap_or_default(),
+                    sample_bytes.pop_front().unwrap_or_default(),
+                    sample_bytes.pop_front().unwrap_or_default(),
+                ];
+                let sample = f32::from_le_bytes(bytes)
+                    .clamp(-1.0, 1.0)
+                    .mul_add(i16::MAX as f32, 0.0)
+                    .round() as i16;
+                packet.extend_from_slice(&sample.to_le_bytes());
+            }
+
+            let timestamp = stream_started_at.elapsed();
+            if !packet.is_empty() {
+                on_packet(timestamp, &packet)?;
+            }
+        }
+
+        let frames = capture
+            .get_next_packet_size()
+            .map_err(|error| error.to_string())?
+            .unwrap_or(0);
+        if frames > 0 {
+            let additional = frames as usize * block_align;
+            sample_bytes.reserve(additional);
+            capture
+                .read_from_device_to_deque(&mut sample_bytes)
+                .map_err(|error| error.to_string())?;
+            continue;
+        }
+
+        event
+            .wait_for_event(1000)
+            .map_err(|error| format!("WASAPI audio capture timed out: {error}"))?;
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn capture_application_audio(
+    _source_pid: u32,
+    _stream_started_at: Instant,
+    _on_packet: impl FnMut(Duration, &[u8]) -> Result<(), String>,
+) -> Result<(), String> {
+    Err("Application audio sharing is only implemented on Windows.".to_string())
 }
 
 impl ShareSourcePreview {
@@ -1298,6 +1492,7 @@ fn load_platform_share_sources() -> Result<Vec<ShareSource>, String> {
 
         sources.push(ShareSource {
             id,
+            pid,
             title,
             app_name,
             preview,
@@ -1392,16 +1587,119 @@ enum ReceiveEvent {
     Error(String),
 }
 
+struct AudioPlayer {
+    queue: Arc<Mutex<VecDeque<f32>>>,
+    _stream: cpal::Stream,
+}
+
+impl AudioPlayer {
+    fn new() -> Result<Self, String> {
+        let host = cpal::default_host();
+        let device = host
+            .default_output_device()
+            .ok_or_else(|| "No default audio output device.".to_string())?;
+        let supported_config = device
+            .default_output_config()
+            .map_err(|error| error.to_string())?;
+        let sample_format = supported_config.sample_format();
+        let config: cpal::StreamConfig = supported_config.into();
+        let queue = Arc::new(Mutex::new(VecDeque::with_capacity(
+            AUDIO_SAMPLE_RATE as usize * AUDIO_CHANNELS,
+        )));
+
+        let stream = match sample_format {
+            SampleFormat::F32 => build_audio_output_stream::<f32>(&device, &config, &queue),
+            SampleFormat::I16 => build_audio_output_stream::<i16>(&device, &config, &queue),
+            SampleFormat::U16 => build_audio_output_stream::<u16>(&device, &config, &queue),
+            other => Err(format!("Unsupported output sample format: {other:?}")),
+        }?;
+        stream.play().map_err(|error| error.to_string())?;
+        Ok(Self {
+            queue,
+            _stream: stream,
+        })
+    }
+
+    fn push(&self, samples: &[f32]) {
+        let Ok(mut queue) = self.queue.lock() else {
+            return;
+        };
+        queue.extend(samples.iter().copied());
+        let max_samples = AUDIO_SAMPLE_RATE as usize * AUDIO_CHANNELS;
+        while queue.len() > max_samples {
+            queue.pop_front();
+        }
+    }
+}
+
+fn build_audio_output_stream<T>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    queue: &Arc<Mutex<VecDeque<f32>>>,
+) -> Result<cpal::Stream, String>
+where
+    T: Sample + SizedSample + FromSample<f32>,
+{
+    let channels = config.channels as usize;
+    let queue = Arc::clone(queue);
+    device
+        .build_output_stream(
+            config,
+            move |output: &mut [T], _| write_audio_output(output, channels, &queue),
+            |error| eprintln!("[receive-audio] output error: {error}"),
+            None,
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn write_audio_output<T>(output: &mut [T], channels: usize, queue: &Arc<Mutex<VecDeque<f32>>>)
+where
+    T: Sample + FromSample<f32>,
+{
+    let Ok(mut queue) = queue.lock() else {
+        output.fill(T::from_sample(0.0));
+        return;
+    };
+
+    for frame in output.chunks_mut(channels) {
+        let left = queue.pop_front().unwrap_or(0.0);
+        let right = queue.pop_front().unwrap_or(left);
+        for (channel, sample) in frame.iter_mut().enumerate() {
+            *sample = T::from_sample(if channel == 0 { left } else { right });
+        }
+    }
+}
+
+fn pcm16le_to_f32(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(2)
+        .map(|sample| i16::from_le_bytes([sample[0], sample[1]]) as f32 / i16::MAX as f32)
+        .collect()
+}
+
 fn write_message(
     writer: &mut impl Write,
     message_type: MessageType,
     payload: &[u8],
 ) -> io::Result<()> {
     let len = payload.len() + 1;
-    writer.write_all(&(len as u32).to_be_bytes())?;
-    writer.write_all(&[message_type as u8])?;
-    writer.write_all(payload)?;
+    let mut message = Vec::with_capacity(len + 4);
+    message.extend_from_slice(&(len as u32).to_be_bytes());
+    message.push(message_type as u8);
+    message.extend_from_slice(payload);
+    writer.write_all(&message)?;
     writer.flush()
+}
+
+fn write_locked_message(
+    writer: &Arc<Mutex<TcpStream>>,
+    message_type: MessageType,
+    payload: &[u8],
+) -> Result<(), String> {
+    let mut writer = writer
+        .lock()
+        .map_err(|_| "writer lock poisoned".to_string())?;
+    write_message(&mut *writer, message_type, payload).map_err(|error| error.to_string())
 }
 
 fn read_message(reader: &mut impl Read) -> io::Result<Vec<u8>> {
@@ -1436,6 +1734,7 @@ fn decode_frames(
     latest_event: &Arc<Mutex<Option<ReceiveEvent>>>,
 ) -> Result<(), String> {
     let mut decoder = Decoder::new().map_err(|error| error.to_string())?;
+    let mut audio_player: Option<AudioPlayer> = None;
     let mut stats = ReceiveStats::default();
 
     loop {
@@ -1447,45 +1746,65 @@ fn decode_frames(
         };
         let message_type = MessageType::try_from(message_type)?;
 
-        if message_type != MessageType::Video {
-            continue;
-        }
+        match message_type {
+            MessageType::Video => {
+                let Some((_timestamp, payload)) = split_timed_payload(payload) else {
+                    continue;
+                };
+                if payload.is_empty() {
+                    continue;
+                }
 
-        if payload.is_empty() {
-            continue;
-        }
+                let decode_started_at = Instant::now();
+                let Some(decoded) = decoder.decode(payload).unwrap_or(None) else {
+                    continue;
+                };
+                let decode_time = decode_started_at.elapsed();
 
-        let decode_started_at = Instant::now();
-        let Some(decoded) = decoder.decode(payload).unwrap_or(None) else {
-            continue;
-        };
-        let decode_time = decode_started_at.elapsed();
+                let (width, height) = decoded.dimensions();
+                let rgba_started_at = Instant::now();
+                let mut rgba = vec![0; decoded.rgba8_len()];
+                decoded.write_rgba8(&mut rgba);
+                let rgba_time = rgba_started_at.elapsed();
 
-        {
-            let (width, height) = decoded.dimensions();
-            let rgba_started_at = Instant::now();
-            let mut rgba = vec![0; decoded.rgba8_len()];
-            decoded.write_rgba8(&mut rgba);
-            let rgba_time = rgba_started_at.elapsed();
+                let frame = CpuRgbaFrame {
+                    width: width as u32,
+                    height: height as u32,
+                    pixels: rgba.into(),
+                };
 
-            let frame = CpuRgbaFrame {
-                width: width as u32,
-                height: height as u32,
-                pixels: rgba.into(),
-            };
-
-            let publish_started_at = Instant::now();
-            if let Ok(mut event) = latest_event.lock() {
-                *event = Some(ReceiveEvent::Frame(frame));
+                let publish_started_at = Instant::now();
+                if let Ok(mut event) = latest_event.lock() {
+                    *event = Some(ReceiveEvent::Frame(frame));
+                }
+                stats.record(
+                    read_time,
+                    decode_time,
+                    rgba_time,
+                    publish_started_at.elapsed(),
+                    payload.len(),
+                    (width as u32, height as u32),
+                );
             }
-            stats.record(
-                read_time,
-                decode_time,
-                rgba_time,
-                publish_started_at.elapsed(),
-                payload.len(),
-                (width as u32, height as u32),
-            );
+            MessageType::Audio => {
+                let Some((_timestamp, sample_rate, channels, pcm_packet)) =
+                    split_audio_payload(payload)
+                else {
+                    continue;
+                };
+                if sample_rate != AUDIO_SAMPLE_RATE || channels != AUDIO_CHANNELS {
+                    continue;
+                }
+                if audio_player.is_none() {
+                    audio_player = Some(AudioPlayer::new()?);
+                    eprintln!("[receive-audio] started pcm playback");
+                }
+                if let Some(player) = &audio_player {
+                    let samples = pcm16le_to_f32(pcm_packet);
+                    player.push(&samples);
+                }
+            }
+            MessageType::Ping | MessageType::Disconnect => {}
         }
     }
 }

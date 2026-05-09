@@ -26,6 +26,7 @@ enum MessageType {
     Ping = 0,
     Video = 1,
     Disconnect = 2,
+    Audio = 3,
 }
 
 impl TryFrom<u8> for MessageType {
@@ -36,6 +37,7 @@ impl TryFrom<u8> for MessageType {
             0 => Ok(Self::Ping),
             1 => Ok(Self::Video),
             2 => Ok(Self::Disconnect),
+            3 => Ok(Self::Audio),
             unknown => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown message type: {unknown}"),
@@ -137,7 +139,7 @@ where
         match message_type {
             MessageType::Ping => continue,
             MessageType::Disconnect => return Ok(()),
-            MessageType::Video => {
+            MessageType::Video | MessageType::Audio => {
                 if message_tx
                     .send(RelayedMessage {
                         sender_id: client_id,

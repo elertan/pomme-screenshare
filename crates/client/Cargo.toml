@@ -6,6 +6,7 @@ description = "GPUI desktop client for Pomme Screenshare."
 license = "MIT"
 
 [dependencies]
+cpal = "0.17.3"
 gpui = "0.2.2"
 image = { version = "0.25.10", default-features = false }
 openh264 = "0.9.3"
@@ -17,4 +18,5 @@ core-video = "0.4.3"
 objc2-core-graphics = "0.3.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
+wasapi = "0.23.0"
 windows-capture = "1.5.0"
