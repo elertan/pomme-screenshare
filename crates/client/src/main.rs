@@ -1,6 +1,8 @@
 mod text_input;
 mod video;
 
+#[cfg(target_os = "windows")]
+use std::sync::Condvar;
 use std::{
     io::{self, Read, Write},
     net::{Shutdown, TcpStream},
@@ -15,6 +17,8 @@ use gpui::{
     StyledImage, Task, Timer, Window, WindowBounds, WindowOptions, div, img, px, rgb, rgba, size,
 };
 use image::{Frame as ImageFrame, RgbaImage};
+#[cfg(target_os = "windows")]
+use openh264::formats::RgbaSliceU8;
 use openh264::{
     OpenH264API,
     decoder::Decoder,
@@ -22,7 +26,7 @@ use openh264::{
         BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode,
         UsageType,
     },
-    formats::{RgbaSliceU8, YUVBuffer, YUVSource},
+    formats::{YUVBuffer, YUVSource},
 };
 use text_input::{
     Backspace, Copy, Cut, Delete, Left, Paste, Right, SelectAll, SelectLeft, SelectRight, TextInput,
@@ -759,29 +763,121 @@ impl ShareSourcePreview {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 struct ShareCaptureSource {
-    window: xcap::Window,
+    latest_frame: Arc<(Mutex<Option<YUVBuffer>>, Condvar)>,
+    control: Option<windows_capture::capture::CaptureControl<WindowsShareCapture, String>>,
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(target_os = "windows")]
 impl ShareCaptureSource {
     fn new(source_id: u32) -> Result<Self, String> {
-        let window = xcap::Window::all()
-            .map_err(format_capture_error)?
-            .into_iter()
-            .find(|window| window.id().ok() == Some(source_id))
-            .ok_or_else(|| "Share source no longer exists.".to_string())?;
+        use windows_capture::{
+            capture::GraphicsCaptureApiHandler,
+            settings::{
+                ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
+                MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
+            },
+            window::Window,
+        };
 
-        Ok(Self { window })
+        let latest_frame = Arc::new((Mutex::new(None), Condvar::new()));
+        let window = Window::from_raw_hwnd(source_id as usize as *mut std::ffi::c_void);
+        let settings = Settings::new(
+            window,
+            CursorCaptureSettings::Default,
+            DrawBorderSettings::Default,
+            SecondaryWindowSettings::Default,
+            MinimumUpdateIntervalSettings::Custom(STREAM_FRAME_INTERVAL),
+            DirtyRegionSettings::Default,
+            ColorFormat::Rgba8,
+            latest_frame.clone(),
+        );
+        let control = WindowsShareCapture::start_free_threaded(settings)
+            .map_err(|error| error.to_string())?;
+
+        Ok(Self {
+            latest_frame,
+            control: Some(control),
+        })
     }
 
     fn capture_frame(&mut self) -> Option<YUVBuffer> {
-        if self.window.is_minimized().unwrap_or(true) {
-            return None;
+        let (frame, frame_ready) = &*self.latest_frame;
+        let mut frame = frame.lock().ok()?;
+        while frame.is_none() {
+            frame = frame_ready.wait(frame).ok()?;
         }
+        frame.take()
+    }
+}
 
-        image_to_yuv(self.window.capture_image().ok()?)
+#[cfg(target_os = "windows")]
+impl Drop for ShareCaptureSource {
+    fn drop(&mut self) {
+        if let Some(control) = self.control.take() {
+            let _ = control.stop();
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsShareCapture {
+    latest_frame: Arc<(Mutex<Option<YUVBuffer>>, Condvar)>,
+}
+
+#[cfg(target_os = "windows")]
+impl windows_capture::capture::GraphicsCaptureApiHandler for WindowsShareCapture {
+    type Flags = Arc<(Mutex<Option<YUVBuffer>>, Condvar)>;
+    type Error = String;
+
+    fn new(ctx: windows_capture::capture::Context<Self::Flags>) -> Result<Self, Self::Error> {
+        Ok(Self {
+            latest_frame: ctx.flags,
+        })
+    }
+
+    fn on_frame_arrived(
+        &mut self,
+        frame: &mut windows_capture::frame::Frame,
+        _capture_control: windows_capture::graphics_capture_api::InternalCaptureControl,
+    ) -> Result<(), Self::Error> {
+        let mut buffer = frame.buffer().map_err(|error| error.to_string())?;
+        let width = buffer.width();
+        let height = buffer.height();
+        let pixels = buffer
+            .as_nopadding_buffer()
+            .map_err(|error| error.to_string())?;
+        if let Some(frame) = rgba_bytes_to_yuv(pixels, width, height) {
+            let (latest_frame, frame_ready) = &*self.latest_frame;
+            if let Ok(mut latest_frame) = latest_frame.lock() {
+                *latest_frame = Some(frame);
+                frame_ready.notify_one();
+            }
+        }
+        Ok(())
+    }
+
+    fn on_closed(&mut self) -> Result<(), Self::Error> {
+        Err("Share source closed.".to_string())
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct ShareCaptureSource {
+    _source_id: u32,
+}
+
+#[cfg(target_os = "macos")]
+impl ShareCaptureSource {
+    fn new(source_id: u32) -> Result<Self, String> {
+        Ok(Self {
+            _source_id: source_id,
+        })
+    }
+
+    fn capture_frame(&mut self) -> Option<YUVBuffer> {
+        unimplemented!("macOS streaming capture will use ScreenCaptureKit")
     }
 }
 
@@ -799,23 +895,17 @@ impl ShareCaptureSource {
     }
 }
 
-fn image_to_yuv(image: RgbaImage) -> Option<YUVBuffer> {
-    let width = image.width() & !1;
-    let height = image.height() & !1;
+#[cfg(target_os = "windows")]
+fn rgba_bytes_to_yuv(bytes: &[u8], width: u32, height: u32) -> Option<YUVBuffer> {
+    let width = width & !1;
+    let height = height & !1;
     if width == 0 || height == 0 {
         return None;
     }
 
-    let image = if width != image.width() || height != image.height() {
-        image::imageops::crop_imm(&image, 0, 0, width, height).to_image()
-    } else {
-        image
-    };
     let dimensions = (width as usize, height as usize);
-
     Some(YUVBuffer::from_rgb_source(RgbaSliceU8::new(
-        image.as_raw(),
-        dimensions,
+        bytes, dimensions,
     )))
 }
 
