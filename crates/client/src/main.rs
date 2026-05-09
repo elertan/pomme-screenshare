@@ -51,11 +51,84 @@ struct PommeApp {
 const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const FRAME_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const FRAME_STALE_TIMEOUT: Duration = Duration::from_secs(10);
-const STREAM_FPS: u64 = 30;
-const STREAM_FRAME_INTERVAL: Duration = Duration::from_millis(1000 / STREAM_FPS);
-const STREAM_BITRATE_BPS: u32 = 2_000_000;
-const STREAM_QP_MIN: u8 = 20;
-const STREAM_QP_MAX: u8 = 42;
+const STREAM_TARGET_FPS: u32 = 60;
+const STREAM_MIN_FPS: u32 = 30;
+const STREAM_TARGET_BITRATE_BPS: u32 = 5_000_000;
+const STREAM_MIN_BITRATE_BPS: u32 = 1_500_000;
+const STREAM_TARGET_QP_MIN: u8 = 18;
+const STREAM_TARGET_QP_MAX: u8 = 42;
+const STREAM_DEGRADED_QP_MIN: u8 = 24;
+const STREAM_DEGRADED_QP_MAX: u8 = 46;
+#[cfg(target_os = "windows")]
+const STREAM_CAPTURE_INTERVAL: Duration = Duration::from_millis(1000 / STREAM_TARGET_FPS as u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StreamSettings {
+    fps: u32,
+    bitrate_bps: u32,
+    qp_min: u8,
+    qp_max: u8,
+}
+
+impl Default for StreamSettings {
+    fn default() -> Self {
+        Self {
+            fps: STREAM_TARGET_FPS,
+            bitrate_bps: STREAM_TARGET_BITRATE_BPS,
+            qp_min: STREAM_TARGET_QP_MIN,
+            qp_max: STREAM_TARGET_QP_MAX,
+        }
+    }
+}
+
+impl StreamSettings {
+    fn frame_interval(self) -> Duration {
+        Duration::from_millis(1000 / self.fps as u64)
+    }
+
+    fn frame_budget(self) -> Duration {
+        Duration::from_secs_f64(1.0 / self.fps as f64)
+    }
+
+    fn degrade(&mut self) -> bool {
+        if self.fps > STREAM_MIN_FPS {
+            self.fps = STREAM_MIN_FPS;
+            return true;
+        }
+
+        if self.bitrate_bps > STREAM_MIN_BITRATE_BPS {
+            self.bitrate_bps = (self.bitrate_bps / 2).max(STREAM_MIN_BITRATE_BPS);
+            self.qp_min = STREAM_DEGRADED_QP_MIN;
+            self.qp_max = STREAM_DEGRADED_QP_MAX;
+            return true;
+        }
+
+        false
+    }
+
+    fn improve(&mut self) -> bool {
+        if self.bitrate_bps < STREAM_TARGET_BITRATE_BPS {
+            self.bitrate_bps = (self.bitrate_bps * 2).min(STREAM_TARGET_BITRATE_BPS);
+            if self.bitrate_bps == STREAM_TARGET_BITRATE_BPS {
+                self.qp_min = STREAM_TARGET_QP_MIN;
+                self.qp_max = STREAM_TARGET_QP_MAX;
+            }
+            return true;
+        }
+
+        if self.fps < STREAM_TARGET_FPS {
+            self.fps = STREAM_TARGET_FPS;
+            return true;
+        }
+
+        false
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ShareSendSnapshot {
+    encode_avg: Duration,
+}
 
 #[derive(Default)]
 struct ShareSendStats {
@@ -77,7 +150,7 @@ impl ShareSendStats {
         write_time: Duration,
         bytes: usize,
         dimensions: (usize, usize),
-    ) {
+    ) -> Option<ShareSendSnapshot> {
         let started_at = *self.started_at.get_or_insert_with(Instant::now);
         self.frames += 1;
         self.bytes += bytes as u64;
@@ -89,6 +162,7 @@ impl ShareSendStats {
 
         let elapsed = started_at.elapsed();
         if elapsed >= Duration::from_secs(1) {
+            let encode_avg = duration_avg(self.encode_time, self.frames);
             eprintln!(
                 "[share-send] fps={:.1} size={}x{} bitrate={:.2}mbps wait_avg={:.2}ms encode_avg={:.2}ms write_avg={:.2}ms",
                 self.frames as f64 / elapsed.as_secs_f64(),
@@ -96,11 +170,14 @@ impl ShareSendStats {
                 self.height,
                 self.bytes as f64 * 8.0 / elapsed.as_secs_f64() / 1_000_000.0,
                 duration_avg_ms(self.wait_time, self.frames),
-                duration_avg_ms(self.encode_time, self.frames),
+                encode_avg.as_secs_f64() * 1000.0,
                 duration_avg_ms(self.write_time, self.frames),
             );
             self.reset();
+            return Some(ShareSendSnapshot { encode_avg });
         }
+
+        None
     }
 
     fn reset(&mut self) {
@@ -222,10 +299,14 @@ impl CaptureStats {
 }
 
 fn duration_avg_ms(duration: Duration, count: u64) -> f64 {
+    duration_avg(duration, count).as_secs_f64() * 1000.0
+}
+
+fn duration_avg(duration: Duration, count: u64) -> Duration {
     if count == 0 {
-        0.0
+        Duration::ZERO
     } else {
-        duration.as_secs_f64() * 1000.0 / count as f64
+        Duration::from_secs_f64(duration.as_secs_f64() / count as f64)
     }
 }
 
@@ -578,25 +659,11 @@ impl PommeApp {
     ) {
         let sender = cx.background_spawn(async move {
             let mut source = ShareCaptureSource::new(source_id)?;
-            let config = EncoderConfig::new()
-                .usage_type(UsageType::ScreenContentRealTime)
-                .bitrate(BitRate::from_bps(STREAM_BITRATE_BPS))
-                .max_frame_rate(FrameRate::from_hz(STREAM_FPS as f32))
-                .rate_control_mode(RateControlMode::Bitrate)
-                .profile(Profile::Baseline)
-                .level(Level::Level_4_0)
-                .qp(QpRange::new(STREAM_QP_MIN, STREAM_QP_MAX))
-                .intra_frame_period(IntraFramePeriod::from_num_frames(STREAM_FPS as u32))
-                .complexity(Complexity::Low)
-                .scene_change_detect(true)
-                .adaptive_quantization(false)
-                .background_detection(false)
-                .skip_frames(true);
-            let api = OpenH264API::from_source();
-            let mut encoder =
-                Encoder::with_api_config(api, config).map_err(|error| error.to_string())?;
+            let mut settings = StreamSettings::default();
+            let mut encoder = create_stream_encoder(settings)?;
             let mut next_frame_at = Instant::now();
             let mut stats = ShareSendStats::default();
+            let mut stable_seconds = 0;
 
             loop {
                 {
@@ -617,20 +684,52 @@ impl PommeApp {
                             .map_err(|error| error.to_string())?;
                         write_time = write_started_at.elapsed();
                     }
-                    stats.record(
+                    if let Some(snapshot) = stats.record(
                         wait_time,
                         encode_time,
                         write_time,
                         payload.len(),
                         frame.dimensions(),
-                    );
+                    ) {
+                        let budget = settings.frame_budget();
+                        if snapshot.encode_avg >= budget.mul_f32(0.9) {
+                            if settings.degrade() {
+                                eprintln!(
+                                    "[share-adapt] degraded to {}fps {}bps qp={}..{}",
+                                    settings.fps,
+                                    settings.bitrate_bps,
+                                    settings.qp_min,
+                                    settings.qp_max
+                                );
+                                encoder = create_stream_encoder(settings)?;
+                                next_frame_at = Instant::now();
+                                stable_seconds = 0;
+                            }
+                        } else if snapshot.encode_avg <= budget.mul_f32(0.45) {
+                            stable_seconds += 1;
+                            if stable_seconds >= 10 && settings.improve() {
+                                eprintln!(
+                                    "[share-adapt] improved to {}fps {}bps qp={}..{}",
+                                    settings.fps,
+                                    settings.bitrate_bps,
+                                    settings.qp_min,
+                                    settings.qp_max
+                                );
+                                encoder = create_stream_encoder(settings)?;
+                                next_frame_at = Instant::now();
+                                stable_seconds = 0;
+                            }
+                        } else {
+                            stable_seconds = 0;
+                        }
+                    }
                 }
 
-                next_frame_at += STREAM_FRAME_INTERVAL;
+                next_frame_at += settings.frame_interval();
                 let now = Instant::now();
                 if now < next_frame_at {
                     Timer::after(next_frame_at - now).await;
-                } else if now.duration_since(next_frame_at) > STREAM_FRAME_INTERVAL {
+                } else if now.duration_since(next_frame_at) > settings.frame_interval() {
                     next_frame_at = now;
                 }
             }
@@ -813,6 +912,25 @@ impl PommeApp {
     }
 }
 
+fn create_stream_encoder(settings: StreamSettings) -> Result<Encoder, String> {
+    let config = EncoderConfig::new()
+        .usage_type(UsageType::ScreenContentRealTime)
+        .bitrate(BitRate::from_bps(settings.bitrate_bps))
+        .max_frame_rate(FrameRate::from_hz(settings.fps as f32))
+        .rate_control_mode(RateControlMode::Bitrate)
+        .profile(Profile::Baseline)
+        .level(Level::Level_4_0)
+        .qp(QpRange::new(settings.qp_min, settings.qp_max))
+        .intra_frame_period(IntraFramePeriod::from_num_frames(settings.fps))
+        .complexity(Complexity::Low)
+        .scene_change_detect(true)
+        .adaptive_quantization(false)
+        .background_detection(false)
+        .skip_frames(true);
+    let api = OpenH264API::from_source();
+    Encoder::with_api_config(api, config).map_err(|error| error.to_string())
+}
+
 fn render_share_source_grid(sources: &ShareSources, cx: &mut Context<PommeApp>) -> AnyElement {
     match sources {
         ShareSources::Idle | ShareSources::Loading => div()
@@ -980,7 +1098,7 @@ impl ShareCaptureSource {
             CursorCaptureSettings::Default,
             DrawBorderSettings::Default,
             SecondaryWindowSettings::Default,
-            MinimumUpdateIntervalSettings::Custom(STREAM_FRAME_INTERVAL),
+            MinimumUpdateIntervalSettings::Custom(STREAM_CAPTURE_INTERVAL),
             DirtyRegionSettings::Default,
             ColorFormat::Rgba8,
             latest_frame.clone(),
