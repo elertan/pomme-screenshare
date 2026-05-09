@@ -196,104 +196,96 @@ mod media_foundation {
         }
 
         unsafe fn create_input_sample(&self, frame: &YUVBuffer) -> Result<IMFSample, String> {
-            unsafe {
-                let input_len = frame.y().len() + frame.u().len() + frame.v().len();
-                let buffer =
-                    MFCreateMemoryBuffer(input_len as u32).map_err(format_windows_error)?;
-
-                let mut data = ptr::null_mut();
-                buffer
-                    .Lock(&mut data, None, None)
-                    .map_err(format_windows_error)?;
-                ptr::copy_nonoverlapping(frame.y().as_ptr(), data, frame.y().len());
-                ptr::copy_nonoverlapping(
-                    frame.u().as_ptr(),
-                    data.add(frame.y().len()),
-                    frame.u().len(),
-                );
-                ptr::copy_nonoverlapping(
-                    frame.v().as_ptr(),
-                    data.add(frame.y().len() + frame.u().len()),
-                    frame.v().len(),
-                );
-                buffer.Unlock().map_err(format_windows_error)?;
-                buffer
-                    .SetCurrentLength(input_len as u32)
-                    .map_err(format_windows_error)?;
-
-                let sample = MFCreateSample().map_err(format_windows_error)?;
-                sample.AddBuffer(&buffer).map_err(format_windows_error)?;
-                sample
-                    .SetSampleTime(self.sample_time)
-                    .map_err(format_windows_error)?;
-                sample
-                    .SetSampleDuration(self.frame_duration)
-                    .map_err(format_windows_error)?;
-
-                Ok(sample)
-            }
-        }
-
-        unsafe fn drain_output(&self) -> Result<Vec<u8>, String> {
-            unsafe {
-                let mut encoded = Vec::new();
-
-                loop {
-                    let output_sample = MFCreateSample().map_err(format_windows_error)?;
-                    let output_buffer = MFCreateMemoryBuffer(self.output_buffer_size)
-                        .map_err(format_windows_error)?;
-                    output_sample
-                        .AddBuffer(&output_buffer)
-                        .map_err(format_windows_error)?;
-
-                    let mut output = [MFT_OUTPUT_DATA_BUFFER {
-                        dwStreamID: 0,
-                        pSample: std::mem::ManuallyDrop::new(Some(output_sample)),
-                        dwStatus: 0,
-                        pEvents: std::mem::ManuallyDrop::new(None),
-                    }];
-                    let mut status = 0;
-
-                    match self.transform.ProcessOutput(0, &mut output, &mut status) {
-                        Ok(()) => {
-                            if let Some(sample) = &*output[0].pSample {
-                                append_sample_bytes(sample, &mut encoded)?;
-                            }
-
-                            if output[0].dwStatus & MFT_OUTPUT_DATA_BUFFER_INCOMPLETE.0 as u32 == 0
-                            {
-                                break;
-                            }
-                        }
-                        Err(error) if error.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => break,
-                        Err(error) => return Err(format_windows_error(error)),
-                    }
-                }
-
-                Ok(encoded)
-            }
-        }
-    }
-
-    unsafe fn append_sample_bytes(sample: &IMFSample, encoded: &mut Vec<u8>) -> Result<(), String> {
-        unsafe {
-            let buffer = sample
-                .ConvertToContiguousBuffer()
-                .map_err(format_windows_error)?;
-            let len = buffer.GetCurrentLength().map_err(format_windows_error)?;
-            if len == 0 {
-                return Ok(());
-            }
+            let input_len = frame.y().len() + frame.u().len() + frame.v().len();
+            let buffer = MFCreateMemoryBuffer(input_len as u32).map_err(format_windows_error)?;
 
             let mut data = ptr::null_mut();
             buffer
                 .Lock(&mut data, None, None)
                 .map_err(format_windows_error)?;
-            encoded.extend_from_slice(std::slice::from_raw_parts(data, len as usize));
+            ptr::copy_nonoverlapping(frame.y().as_ptr(), data, frame.y().len());
+            ptr::copy_nonoverlapping(
+                frame.u().as_ptr(),
+                data.add(frame.y().len()),
+                frame.u().len(),
+            );
+            ptr::copy_nonoverlapping(
+                frame.v().as_ptr(),
+                data.add(frame.y().len() + frame.u().len()),
+                frame.v().len(),
+            );
             buffer.Unlock().map_err(format_windows_error)?;
+            buffer
+                .SetCurrentLength(input_len as u32)
+                .map_err(format_windows_error)?;
 
-            Ok(())
+            let sample = MFCreateSample().map_err(format_windows_error)?;
+            sample.AddBuffer(&buffer).map_err(format_windows_error)?;
+            sample
+                .SetSampleTime(self.sample_time)
+                .map_err(format_windows_error)?;
+            sample
+                .SetSampleDuration(self.frame_duration)
+                .map_err(format_windows_error)?;
+
+            Ok(sample)
         }
+
+        unsafe fn drain_output(&self) -> Result<Vec<u8>, String> {
+            let mut encoded = Vec::new();
+
+            loop {
+                let output_sample = MFCreateSample().map_err(format_windows_error)?;
+                let output_buffer =
+                    MFCreateMemoryBuffer(self.output_buffer_size).map_err(format_windows_error)?;
+                output_sample
+                    .AddBuffer(&output_buffer)
+                    .map_err(format_windows_error)?;
+
+                let mut output = [MFT_OUTPUT_DATA_BUFFER {
+                    dwStreamID: 0,
+                    pSample: std::mem::ManuallyDrop::new(Some(output_sample)),
+                    dwStatus: 0,
+                    pEvents: std::mem::ManuallyDrop::new(None),
+                }];
+                let mut status = 0;
+
+                match self.transform.ProcessOutput(0, &mut output, &mut status) {
+                    Ok(()) => {
+                        if let Some(sample) = &*output[0].pSample {
+                            append_sample_bytes(sample, &mut encoded)?;
+                        }
+
+                        if output[0].dwStatus & MFT_OUTPUT_DATA_BUFFER_INCOMPLETE.0 as u32 == 0 {
+                            break;
+                        }
+                    }
+                    Err(error) if error.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => break,
+                    Err(error) => return Err(format_windows_error(error)),
+                }
+            }
+
+            Ok(encoded)
+        }
+    }
+
+    unsafe fn append_sample_bytes(sample: &IMFSample, encoded: &mut Vec<u8>) -> Result<(), String> {
+        let buffer = sample
+            .ConvertToContiguousBuffer()
+            .map_err(format_windows_error)?;
+        let len = buffer.GetCurrentLength().map_err(format_windows_error)?;
+        if len == 0 {
+            return Ok(());
+        }
+
+        let mut data = ptr::null_mut();
+        buffer
+            .Lock(&mut data, None, None)
+            .map_err(format_windows_error)?;
+        encoded.extend_from_slice(std::slice::from_raw_parts(data, len as usize));
+        buffer.Unlock().map_err(format_windows_error)?;
+
+        Ok(())
     }
 
     fn ensure_media_foundation_started() -> Result<(), String> {
