@@ -965,6 +965,7 @@ fn load_platform_share_sources() -> Result<Vec<ShareSource>, String> {
 
         let (preview, preview_error) = match window.capture_image() {
             Ok(image) => {
+                let image = normalize_preview_image(image);
                 let thumbnail = image::imageops::thumbnail(&image, 360, 180);
                 (Some(ShareSourcePreview::from_image(thumbnail)), None)
             }
@@ -985,6 +986,26 @@ fn load_platform_share_sources() -> Result<Vec<ShareSource>, String> {
     }
 
     Ok(sources)
+}
+
+fn normalize_preview_image(image: RgbaImage) -> RgbaImage {
+    #[cfg(target_os = "windows")]
+    {
+        bgra_image_to_rgba(image)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        image
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn bgra_image_to_rgba(mut image: RgbaImage) -> RgbaImage {
+    for pixel in image.as_mut().chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    image
 }
 
 fn should_hide_share_source(title: &str, app_name: &str, width: u32, height: u32) -> bool {
