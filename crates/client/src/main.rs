@@ -23,8 +23,8 @@ use openh264::{
     OpenH264API,
     decoder::Decoder,
     encoder::{
-        BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode,
-        UsageType,
+        BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, Level, Profile,
+        QpRange, RateControlMode, UsageType,
     },
     formats::{YUVBuffer, YUVSource},
 };
@@ -54,6 +54,8 @@ const FRAME_STALE_TIMEOUT: Duration = Duration::from_secs(10);
 const STREAM_FPS: u64 = 30;
 const STREAM_FRAME_INTERVAL: Duration = Duration::from_millis(1000 / STREAM_FPS);
 const STREAM_BITRATE_BPS: u32 = 2_000_000;
+const STREAM_QP_MIN: u8 = 20;
+const STREAM_QP_MAX: u8 = 42;
 
 #[derive(Default)]
 struct ShareSendStats {
@@ -63,6 +65,8 @@ struct ShareSendStats {
     wait_time: Duration,
     encode_time: Duration,
     write_time: Duration,
+    width: usize,
+    height: usize,
 }
 
 impl ShareSendStats {
@@ -72,6 +76,7 @@ impl ShareSendStats {
         encode_time: Duration,
         write_time: Duration,
         bytes: usize,
+        dimensions: (usize, usize),
     ) {
         let started_at = *self.started_at.get_or_insert_with(Instant::now);
         self.frames += 1;
@@ -79,12 +84,16 @@ impl ShareSendStats {
         self.wait_time += wait_time;
         self.encode_time += encode_time;
         self.write_time += write_time;
+        self.width = dimensions.0;
+        self.height = dimensions.1;
 
         let elapsed = started_at.elapsed();
         if elapsed >= Duration::from_secs(1) {
             eprintln!(
-                "[share-send] fps={:.1} bitrate={:.2}mbps wait_avg={:.2}ms encode_avg={:.2}ms write_avg={:.2}ms",
+                "[share-send] fps={:.1} size={}x{} bitrate={:.2}mbps wait_avg={:.2}ms encode_avg={:.2}ms write_avg={:.2}ms",
                 self.frames as f64 / elapsed.as_secs_f64(),
+                self.width,
+                self.height,
                 self.bytes as f64 * 8.0 / elapsed.as_secs_f64() / 1_000_000.0,
                 duration_avg_ms(self.wait_time, self.frames),
                 duration_avg_ms(self.encode_time, self.frames),
@@ -111,6 +120,8 @@ struct ReceiveStats {
     decode_time: Duration,
     rgba_time: Duration,
     publish_time: Duration,
+    width: u32,
+    height: u32,
 }
 
 impl ReceiveStats {
@@ -121,6 +132,7 @@ impl ReceiveStats {
         rgba_time: Duration,
         publish_time: Duration,
         bytes: usize,
+        dimensions: (u32, u32),
     ) {
         let started_at = *self.started_at.get_or_insert_with(Instant::now);
         self.frames += 1;
@@ -129,12 +141,16 @@ impl ReceiveStats {
         self.decode_time += decode_time;
         self.rgba_time += rgba_time;
         self.publish_time += publish_time;
+        self.width = dimensions.0;
+        self.height = dimensions.1;
 
         let elapsed = started_at.elapsed();
         if elapsed >= Duration::from_secs(1) {
             eprintln!(
-                "[receive] fps={:.1} bitrate={:.2}mbps read_avg={:.2}ms decode_avg={:.2}ms rgba_avg={:.2}ms publish_avg={:.2}ms",
+                "[receive] fps={:.1} size={}x{} bitrate={:.2}mbps read_avg={:.2}ms decode_avg={:.2}ms rgba_avg={:.2}ms publish_avg={:.2}ms",
                 self.frames as f64 / elapsed.as_secs_f64(),
+                self.width,
+                self.height,
                 self.bytes as f64 * 8.0 / elapsed.as_secs_f64() / 1_000_000.0,
                 duration_avg_ms(self.read_time, self.frames),
                 duration_avg_ms(self.decode_time, self.frames),
@@ -161,22 +177,34 @@ struct CaptureStats {
     buffer_time: Duration,
     convert_time: Duration,
     publish_time: Duration,
+    width: u32,
+    height: u32,
 }
 
 #[cfg(target_os = "windows")]
 impl CaptureStats {
-    fn record(&mut self, buffer_time: Duration, convert_time: Duration, publish_time: Duration) {
+    fn record(
+        &mut self,
+        buffer_time: Duration,
+        convert_time: Duration,
+        publish_time: Duration,
+        dimensions: (u32, u32),
+    ) {
         let started_at = *self.started_at.get_or_insert_with(Instant::now);
         self.frames += 1;
         self.buffer_time += buffer_time;
         self.convert_time += convert_time;
         self.publish_time += publish_time;
+        self.width = dimensions.0;
+        self.height = dimensions.1;
 
         let elapsed = started_at.elapsed();
         if elapsed >= Duration::from_secs(1) {
             eprintln!(
-                "[share-capture] fps={:.1} buffer_avg={:.2}ms convert_avg={:.2}ms publish_avg={:.2}ms",
+                "[share-capture] fps={:.1} size={}x{} buffer_avg={:.2}ms convert_avg={:.2}ms publish_avg={:.2}ms",
                 self.frames as f64 / elapsed.as_secs_f64(),
+                self.width,
+                self.height,
                 duration_avg_ms(self.buffer_time, self.frames),
                 duration_avg_ms(self.convert_time, self.frames),
                 duration_avg_ms(self.publish_time, self.frames),
@@ -555,12 +583,15 @@ impl PommeApp {
                 .bitrate(BitRate::from_bps(STREAM_BITRATE_BPS))
                 .max_frame_rate(FrameRate::from_hz(STREAM_FPS as f32))
                 .rate_control_mode(RateControlMode::Bitrate)
+                .profile(Profile::Baseline)
+                .level(Level::Level_4_0)
+                .qp(QpRange::new(STREAM_QP_MIN, STREAM_QP_MAX))
                 .intra_frame_period(IntraFramePeriod::from_num_frames(STREAM_FPS as u32))
                 .complexity(Complexity::Low)
-                .scene_change_detect(false)
+                .scene_change_detect(true)
                 .adaptive_quantization(false)
                 .background_detection(false)
-                .skip_frames(false);
+                .skip_frames(true);
             let api = OpenH264API::from_source();
             let mut encoder =
                 Encoder::with_api_config(api, config).map_err(|error| error.to_string())?;
@@ -586,7 +617,13 @@ impl PommeApp {
                             .map_err(|error| error.to_string())?;
                         write_time = write_started_at.elapsed();
                     }
-                    stats.record(wait_time, encode_time, write_time, payload.len());
+                    stats.record(
+                        wait_time,
+                        encode_time,
+                        write_time,
+                        payload.len(),
+                        frame.dimensions(),
+                    );
                 }
 
                 next_frame_at += STREAM_FRAME_INTERVAL;
@@ -1017,8 +1054,12 @@ impl windows_capture::capture::GraphicsCaptureApiHandler for WindowsShareCapture
                 *latest_frame = Some(frame);
                 frame_ready.notify_one();
             }
-            self.stats
-                .record(buffer_time, convert_time, publish_started_at.elapsed());
+            self.stats.record(
+                buffer_time,
+                convert_time,
+                publish_started_at.elapsed(),
+                (width, height),
+            );
         }
         Ok(())
     }
@@ -1325,6 +1366,7 @@ fn decode_frames(
                 rgba_time,
                 publish_started_at.elapsed(),
                 payload.len(),
+                (width as u32, height as u32),
             );
         }
     }
