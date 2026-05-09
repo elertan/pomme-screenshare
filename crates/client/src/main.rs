@@ -418,16 +418,7 @@ impl PommeApp {
                                     STREAM_FPS as u32,
                                     STREAM_BITRATE_BPS,
                                 )?);
-                                let encoder = encoder.as_mut().expect("encoder just initialized");
-                                eprintln!(
-                                    "share stream using {} at {}x{} {}fps {}bps",
-                                    encoder.name(),
-                                    frame.dimensions().0,
-                                    frame.dimensions().1,
-                                    STREAM_FPS,
-                                    STREAM_BITRATE_BPS
-                                );
-                                encoder
+                                encoder.as_mut().expect("encoder just initialized")
                             }
                         };
 

@@ -13,7 +13,6 @@ use openh264::formats::YUVBuffer;
 
 pub struct H264Encoder {
     dimensions: (usize, usize),
-    name: &'static str,
     #[cfg(not(target_os = "windows"))]
     inner: Encoder,
     #[cfg(target_os = "windows")]
@@ -37,31 +36,19 @@ impl H264Encoder {
                 .skip_frames(false);
             let api = OpenH264API::from_source();
             let inner = Encoder::with_api_config(api, config).map_err(|error| error.to_string())?;
-            Ok(Self {
-                dimensions,
-                name: "OpenH264 software encoder",
-                inner,
-            })
+            Ok(Self { dimensions, inner })
         }
 
         #[cfg(target_os = "windows")]
         {
             let inner =
                 media_foundation::MediaFoundationH264Encoder::new(dimensions, fps, bitrate_bps)?;
-            Ok(Self {
-                dimensions,
-                name: inner.name(),
-                inner,
-            })
+            Ok(Self { dimensions, inner })
         }
     }
 
     pub fn dimensions(&self) -> (usize, usize) {
         self.dimensions
-    }
-
-    pub fn name(&self) -> &'static str {
-        self.name
     }
 
     pub fn encode(&mut self, frame: &YUVBuffer) -> Result<Vec<u8>, String> {
@@ -92,7 +79,6 @@ mod media_foundation {
             Media::MediaFoundation::*,
             System::Com::{
                 CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
-                CoTaskMemFree,
             },
         },
         core::Error as WindowsError,
@@ -104,8 +90,6 @@ mod media_foundation {
 
     pub struct MediaFoundationH264Encoder {
         transform: IMFTransform,
-        activate: Option<IMFActivate>,
-        name: &'static str,
         output_buffer_size: u32,
         frame_duration: i64,
         sample_time: i64,
@@ -117,7 +101,9 @@ mod media_foundation {
             ensure_media_foundation_started()?;
 
             unsafe {
-                let (transform, activate, name) = create_encoder_transform()?;
+                let transform: IMFTransform =
+                    CoCreateInstance(&CMSH264EncoderMFT, None, CLSCTX_INPROC_SERVER)
+                        .map_err(format_windows_error)?;
 
                 let output_type = MFCreateMediaType().map_err(format_windows_error)?;
                 output_type
@@ -188,18 +174,12 @@ mod media_foundation {
 
                 Ok(Self {
                     transform,
-                    activate,
-                    name,
                     output_buffer_size,
                     frame_duration: HNS_PER_SECOND / fps as i64,
                     sample_time: 0,
                     dimensions,
                 })
             }
-        }
-
-        pub fn name(&self) -> &'static str {
-            self.name
         }
 
         pub fn encode(&mut self, frame: &YUVBuffer) -> Result<Vec<u8>, String> {
@@ -293,64 +273,6 @@ mod media_foundation {
 
                 Ok(encoded)
             }
-        }
-    }
-
-    impl Drop for MediaFoundationH264Encoder {
-        fn drop(&mut self) {
-            if let Some(activate) = &self.activate {
-                unsafe {
-                    let _ = activate.ShutdownObject();
-                }
-            }
-        }
-    }
-
-    unsafe fn create_encoder_transform()
-    -> Result<(IMFTransform, Option<IMFActivate>, &'static str), String> {
-        unsafe {
-            let input_type = MFT_REGISTER_TYPE_INFO {
-                guidMajorType: MFMediaType_Video,
-                guidSubtype: MFVideoFormat_NV12,
-            };
-            let output_type = MFT_REGISTER_TYPE_INFO {
-                guidMajorType: MFMediaType_Video,
-                guidSubtype: MFVideoFormat_H264,
-            };
-            let mut activates = ptr::null_mut();
-            let mut activate_count = 0;
-            let hardware_result = MFTEnumEx(
-                MFT_CATEGORY_VIDEO_ENCODER,
-                MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
-                Some(&input_type as *const _),
-                Some(&output_type as *const _),
-                &mut activates,
-                &mut activate_count,
-            );
-
-            if hardware_result.is_ok() && activate_count > 0 && !activates.is_null() {
-                let activate = (*activates).as_ref().cloned().ok_or_else(|| {
-                    "Media Foundation hardware encoder activation missing".to_string()
-                })?;
-                CoTaskMemFree(Some(activates as *const _));
-                let transform = activate
-                    .ActivateObject::<IMFTransform>()
-                    .map_err(format_windows_error)?;
-                return Ok((
-                    transform,
-                    Some(activate),
-                    "Media Foundation hardware H.264 encoder",
-                ));
-            }
-
-            if !activates.is_null() {
-                CoTaskMemFree(Some(activates as *const _));
-            }
-
-            let transform: IMFTransform =
-                CoCreateInstance(&CMSH264EncoderMFT, None, CLSCTX_INPROC_SERVER)
-                    .map_err(format_windows_error)?;
-            Ok((transform, None, "Media Foundation software H.264 encoder"))
         }
     }
 
