@@ -1,4 +1,3 @@
-mod h264_encoder;
 mod text_input;
 mod video;
 
@@ -15,10 +14,14 @@ use gpui::{
     IntoElement, KeyBinding, ParentElement, Render, StatefulInteractiveElement, Styled,
     StyledImage, Task, Timer, Window, WindowBounds, WindowOptions, div, img, px, rgb, rgba, size,
 };
-use h264_encoder::H264Encoder;
 use image::{Frame as ImageFrame, RgbaImage};
 use openh264::{
+    OpenH264API,
     decoder::Decoder,
+    encoder::{
+        BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode,
+        UsageType,
+    },
     formats::{RgbaSliceU8, YUVBuffer, YUVSource},
 };
 use text_input::{
@@ -397,7 +400,20 @@ impl PommeApp {
     ) {
         let sender = cx.background_spawn(async move {
             let mut source = ShareCaptureSource::new(source_id)?;
-            let mut encoder: Option<H264Encoder> = None;
+            let config = EncoderConfig::new()
+                .usage_type(UsageType::ScreenContentRealTime)
+                .bitrate(BitRate::from_bps(STREAM_BITRATE_BPS))
+                .max_frame_rate(FrameRate::from_hz(STREAM_FPS as f32))
+                .rate_control_mode(RateControlMode::Bitrate)
+                .intra_frame_period(IntraFramePeriod::from_num_frames(STREAM_FPS as u32))
+                .complexity(Complexity::Low)
+                .scene_change_detect(false)
+                .adaptive_quantization(false)
+                .background_detection(false)
+                .skip_frames(false);
+            let api = OpenH264API::from_source();
+            let mut encoder =
+                Encoder::with_api_config(api, config).map_err(|error| error.to_string())?;
             let mut next_frame_at = Instant::now();
 
             loop {
@@ -406,19 +422,8 @@ impl PommeApp {
                         return Ok(());
                     };
 
-                    let encoder = match encoder.as_mut() {
-                        Some(encoder) if encoder.dimensions() == frame.dimensions() => encoder,
-                        _ => {
-                            encoder = Some(H264Encoder::new(
-                                frame.dimensions(),
-                                STREAM_FPS as u32,
-                                STREAM_BITRATE_BPS,
-                            )?);
-                            encoder.as_mut().expect("encoder just initialized")
-                        }
-                    };
-
-                    let payload = encoder.encode(&frame)?;
+                    let bitstream = encoder.encode(&frame).map_err(|error| error.to_string())?;
+                    let payload = bitstream.to_vec();
                     if !payload.is_empty() {
                         write_message(&mut connection, MessageType::Video, &payload)
                             .map_err(|error| error.to_string())?;
