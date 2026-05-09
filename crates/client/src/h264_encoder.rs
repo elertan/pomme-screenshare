@@ -117,48 +117,8 @@ mod media_foundation {
             ensure_media_foundation_started()?;
 
             unsafe {
-                if let Some((transform, activate, name)) = create_hardware_encoder_transform()? {
-                    match Self::from_transform(
-                        transform,
-                        Some(activate.clone()),
-                        name,
-                        dimensions,
-                        fps,
-                        bitrate_bps,
-                    ) {
-                        Ok(encoder) => return Ok(encoder),
-                        Err(error) => {
-                            let _ = activate.ShutdownObject();
-                            eprintln!(
-                                "share stream could not start {name}: {error}; falling back to Media Foundation software H.264 encoder"
-                            );
-                        }
-                    }
-                }
+                let (transform, activate, name) = create_encoder_transform()?;
 
-                let transform: IMFTransform =
-                    CoCreateInstance(&CMSH264EncoderMFT, None, CLSCTX_INPROC_SERVER)
-                        .map_err(format_windows_error)?;
-                Self::from_transform(
-                    transform,
-                    None,
-                    "Media Foundation software H.264 encoder",
-                    dimensions,
-                    fps,
-                    bitrate_bps,
-                )
-            }
-        }
-
-        unsafe fn from_transform(
-            transform: IMFTransform,
-            activate: Option<IMFActivate>,
-            name: &'static str,
-            dimensions: (usize, usize),
-            fps: u32,
-            bitrate_bps: u32,
-        ) -> Result<Self, String> {
-            unsafe {
                 let output_type = MFCreateMediaType().map_err(format_windows_error)?;
                 output_type
                     .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
@@ -224,9 +184,7 @@ mod media_foundation {
                 let output_info = transform
                     .GetOutputStreamInfo(0)
                     .map_err(format_windows_error)?;
-                let output_buffer_size = output_info
-                    .cbSize
-                    .max((dimensions.0 * dimensions.1 / 2).max(1024 * 1024) as u32);
+                let output_buffer_size = output_info.cbSize.max(1024 * 1024);
 
                 Ok(Self {
                     transform,
@@ -348,8 +306,8 @@ mod media_foundation {
         }
     }
 
-    unsafe fn create_hardware_encoder_transform()
-    -> Result<Option<(IMFTransform, IMFActivate, &'static str)>, String> {
+    unsafe fn create_encoder_transform()
+    -> Result<(IMFTransform, Option<IMFActivate>, &'static str), String> {
         unsafe {
             let input_type = MFT_REGISTER_TYPE_INFO {
                 guidMajorType: MFMediaType_Video,
@@ -370,9 +328,7 @@ mod media_foundation {
                 &mut activate_count,
             );
 
-            let has_hardware =
-                hardware_result.is_ok() && activate_count > 0 && !activates.is_null();
-            if has_hardware {
+            if hardware_result.is_ok() && activate_count > 0 && !activates.is_null() {
                 let activate = (*activates).as_ref().cloned().ok_or_else(|| {
                     "Media Foundation hardware encoder activation missing".to_string()
                 })?;
@@ -380,18 +336,21 @@ mod media_foundation {
                 let transform = activate
                     .ActivateObject::<IMFTransform>()
                     .map_err(format_windows_error)?;
-                return Ok(Some((
+                return Ok((
                     transform,
-                    activate,
+                    Some(activate),
                     "Media Foundation hardware H.264 encoder",
-                )));
+                ));
             }
 
             if !activates.is_null() {
                 CoTaskMemFree(Some(activates as *const _));
             }
 
-            Ok(None)
+            let transform: IMFTransform =
+                CoCreateInstance(&CMSH264EncoderMFT, None, CLSCTX_INPROC_SERVER)
+                    .map_err(format_windows_error)?;
+            Ok((transform, None, "Media Foundation software H.264 encoder"))
         }
     }
 
