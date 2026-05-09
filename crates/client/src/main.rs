@@ -55,6 +55,152 @@ const STREAM_FPS: u64 = 30;
 const STREAM_FRAME_INTERVAL: Duration = Duration::from_millis(1000 / STREAM_FPS);
 const STREAM_BITRATE_BPS: u32 = 2_000_000;
 
+#[derive(Default)]
+struct ShareSendStats {
+    started_at: Option<Instant>,
+    frames: u64,
+    bytes: u64,
+    wait_time: Duration,
+    encode_time: Duration,
+    write_time: Duration,
+}
+
+impl ShareSendStats {
+    fn record(
+        &mut self,
+        wait_time: Duration,
+        encode_time: Duration,
+        write_time: Duration,
+        bytes: usize,
+    ) {
+        let started_at = *self.started_at.get_or_insert_with(Instant::now);
+        self.frames += 1;
+        self.bytes += bytes as u64;
+        self.wait_time += wait_time;
+        self.encode_time += encode_time;
+        self.write_time += write_time;
+
+        let elapsed = started_at.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            eprintln!(
+                "[share-send] fps={:.1} bitrate={:.2}mbps wait_avg={:.2}ms encode_avg={:.2}ms write_avg={:.2}ms",
+                self.frames as f64 / elapsed.as_secs_f64(),
+                self.bytes as f64 * 8.0 / elapsed.as_secs_f64() / 1_000_000.0,
+                duration_avg_ms(self.wait_time, self.frames),
+                duration_avg_ms(self.encode_time, self.frames),
+                duration_avg_ms(self.write_time, self.frames),
+            );
+            self.reset();
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self {
+            started_at: Some(Instant::now()),
+            ..Default::default()
+        };
+    }
+}
+
+#[derive(Default)]
+struct ReceiveStats {
+    started_at: Option<Instant>,
+    frames: u64,
+    bytes: u64,
+    read_time: Duration,
+    decode_time: Duration,
+    rgba_time: Duration,
+    publish_time: Duration,
+}
+
+impl ReceiveStats {
+    fn record(
+        &mut self,
+        read_time: Duration,
+        decode_time: Duration,
+        rgba_time: Duration,
+        publish_time: Duration,
+        bytes: usize,
+    ) {
+        let started_at = *self.started_at.get_or_insert_with(Instant::now);
+        self.frames += 1;
+        self.bytes += bytes as u64;
+        self.read_time += read_time;
+        self.decode_time += decode_time;
+        self.rgba_time += rgba_time;
+        self.publish_time += publish_time;
+
+        let elapsed = started_at.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            eprintln!(
+                "[receive] fps={:.1} bitrate={:.2}mbps read_avg={:.2}ms decode_avg={:.2}ms rgba_avg={:.2}ms publish_avg={:.2}ms",
+                self.frames as f64 / elapsed.as_secs_f64(),
+                self.bytes as f64 * 8.0 / elapsed.as_secs_f64() / 1_000_000.0,
+                duration_avg_ms(self.read_time, self.frames),
+                duration_avg_ms(self.decode_time, self.frames),
+                duration_avg_ms(self.rgba_time, self.frames),
+                duration_avg_ms(self.publish_time, self.frames),
+            );
+            self.reset();
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self {
+            started_at: Some(Instant::now()),
+            ..Default::default()
+        };
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Default)]
+struct CaptureStats {
+    started_at: Option<Instant>,
+    frames: u64,
+    buffer_time: Duration,
+    convert_time: Duration,
+    publish_time: Duration,
+}
+
+#[cfg(target_os = "windows")]
+impl CaptureStats {
+    fn record(&mut self, buffer_time: Duration, convert_time: Duration, publish_time: Duration) {
+        let started_at = *self.started_at.get_or_insert_with(Instant::now);
+        self.frames += 1;
+        self.buffer_time += buffer_time;
+        self.convert_time += convert_time;
+        self.publish_time += publish_time;
+
+        let elapsed = started_at.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            eprintln!(
+                "[share-capture] fps={:.1} buffer_avg={:.2}ms convert_avg={:.2}ms publish_avg={:.2}ms",
+                self.frames as f64 / elapsed.as_secs_f64(),
+                duration_avg_ms(self.buffer_time, self.frames),
+                duration_avg_ms(self.convert_time, self.frames),
+                duration_avg_ms(self.publish_time, self.frames),
+            );
+            self.reset();
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self {
+            started_at: Some(Instant::now()),
+            ..Default::default()
+        };
+    }
+}
+
+fn duration_avg_ms(duration: Duration, count: u64) -> f64 {
+    if count == 0 {
+        0.0
+    } else {
+        duration.as_secs_f64() * 1000.0 / count as f64
+    }
+}
+
 enum AppView {
     Connect,
     Connected,
@@ -419,19 +565,28 @@ impl PommeApp {
             let mut encoder =
                 Encoder::with_api_config(api, config).map_err(|error| error.to_string())?;
             let mut next_frame_at = Instant::now();
+            let mut stats = ShareSendStats::default();
 
             loop {
                 {
+                    let wait_started_at = Instant::now();
                     let Some(frame) = source.capture_frame() else {
                         return Ok(());
                     };
+                    let wait_time = wait_started_at.elapsed();
 
+                    let encode_started_at = Instant::now();
                     let bitstream = encoder.encode(&frame).map_err(|error| error.to_string())?;
                     let payload = bitstream.to_vec();
+                    let encode_time = encode_started_at.elapsed();
+                    let mut write_time = Duration::ZERO;
                     if !payload.is_empty() {
+                        let write_started_at = Instant::now();
                         write_message(&mut connection, MessageType::Video, &payload)
                             .map_err(|error| error.to_string())?;
+                        write_time = write_started_at.elapsed();
                     }
+                    stats.record(wait_time, encode_time, write_time, payload.len());
                 }
 
                 next_frame_at += STREAM_FRAME_INTERVAL;
@@ -824,6 +979,7 @@ impl Drop for ShareCaptureSource {
 #[cfg(target_os = "windows")]
 struct WindowsShareCapture {
     latest_frame: Arc<(Mutex<Option<YUVBuffer>>, Condvar)>,
+    stats: CaptureStats,
 }
 
 #[cfg(target_os = "windows")]
@@ -834,6 +990,7 @@ impl windows_capture::capture::GraphicsCaptureApiHandler for WindowsShareCapture
     fn new(ctx: windows_capture::capture::Context<Self::Flags>) -> Result<Self, Self::Error> {
         Ok(Self {
             latest_frame: ctx.flags,
+            stats: CaptureStats::default(),
         })
     }
 
@@ -842,18 +999,26 @@ impl windows_capture::capture::GraphicsCaptureApiHandler for WindowsShareCapture
         frame: &mut windows_capture::frame::Frame,
         _capture_control: windows_capture::graphics_capture_api::InternalCaptureControl,
     ) -> Result<(), Self::Error> {
+        let buffer_started_at = Instant::now();
         let mut buffer = frame.buffer().map_err(|error| error.to_string())?;
         let width = buffer.width();
         let height = buffer.height();
         let pixels = buffer
             .as_nopadding_buffer()
             .map_err(|error| error.to_string())?;
+        let buffer_time = buffer_started_at.elapsed();
+
+        let convert_started_at = Instant::now();
         if let Some(frame) = bgra_bytes_to_yuv(pixels, width, height) {
+            let convert_time = convert_started_at.elapsed();
+            let publish_started_at = Instant::now();
             let (latest_frame, frame_ready) = &*self.latest_frame;
             if let Ok(mut latest_frame) = latest_frame.lock() {
                 *latest_frame = Some(frame);
                 frame_ready.notify_one();
             }
+            self.stats
+                .record(buffer_time, convert_time, publish_started_at.elapsed());
         }
         Ok(())
     }
@@ -1109,9 +1274,12 @@ fn decode_frames(
     latest_event: &Arc<Mutex<Option<ReceiveEvent>>>,
 ) -> Result<(), String> {
     let mut decoder = Decoder::new().map_err(|error| error.to_string())?;
+    let mut stats = ReceiveStats::default();
 
     loop {
+        let read_started_at = Instant::now();
         let message = read_message(connection).map_err(|error| error.to_string())?;
+        let read_time = read_started_at.elapsed();
         let Some((&message_type, payload)) = message.split_first() else {
             continue;
         };
@@ -1125,14 +1293,18 @@ fn decode_frames(
             continue;
         }
 
+        let decode_started_at = Instant::now();
         let Some(decoded) = decoder.decode(payload).unwrap_or(None) else {
             continue;
         };
+        let decode_time = decode_started_at.elapsed();
 
         {
             let (width, height) = decoded.dimensions();
+            let rgba_started_at = Instant::now();
             let mut rgba = vec![0; decoded.rgba8_len()];
             decoded.write_rgba8(&mut rgba);
+            let rgba_time = rgba_started_at.elapsed();
 
             let frame = CpuRgbaFrame {
                 width: width as u32,
@@ -1140,9 +1312,17 @@ fn decode_frames(
                 pixels: rgba.into(),
             };
 
+            let publish_started_at = Instant::now();
             if let Ok(mut event) = latest_event.lock() {
                 *event = Some(ReceiveEvent::Frame(frame));
             }
+            stats.record(
+                read_time,
+                decode_time,
+                rgba_time,
+                publish_started_at.elapsed(),
+                payload.len(),
+            );
         }
     }
 }
